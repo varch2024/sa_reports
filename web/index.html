@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Stock Recommendations</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <h1>AI Stock Recommendations</h1>
+      <span class="subtitle">US &amp; India Market Analysis</span>
+    </div>
+    <div class="header-right">
+      <select id="report-select" aria-label="Select report date">
+        <option value="">Loading reports...</option>
+      </select>
+      <button id="theme-toggle" aria-label="Toggle theme" title="Toggle dark/light mode">
+        <span class="icon-sun">&#9728;</span>
+        <span class="icon-moon">&#9790;</span>
+      </button>
+    </div>
+  </header>
+
+  <nav id="strategy-tabs" class="tabs">
+    <button class="tab active" data-section="overview">Overview</button>
+    <button class="tab" data-section="unified">Unified Recommendations</button>
+    <button class="tab" data-section="top-picks">Top Picks</button>
+    <button class="tab" data-section="sector-heatmap">Sector Heatmap</button>
+    <button class="tab" data-section="us-market">US Market</button>
+    <button class="tab" data-section="india-market">India Market</button>
+    <button class="tab" data-section="swing">Swing Trades</button>
+    <button class="tab" data-section="us-full-report">US Full Report</button>
+    <button class="tab" data-section="india-full-report">India Full Report</button>
+  </nav>
+
+  <main id="content">
+    <div id="loading" class="loading">
+      <div class="spinner"></div>
+      <p>Loading report...</p>
+    </div>
+    <div id="no-reports" class="empty-state" style="display:none;">
+      <h2>No Reports Found</h2>
+      <p>Run your first daily scan to generate a report:</p>
+      <code>py -3.12 -m scripts.run_all --fetch</code>
+    </div>
+
+    <section id="section-overview" class="section"></section>
+    <section id="section-unified" class="section" style="display:none;"></section>
+    <section id="section-top-picks" class="section" style="display:none;"></section>
+    <section id="section-sector-heatmap" class="section" style="display:none;"></section>
+    <section id="section-us-market" class="section" style="display:none;"></section>
+    <section id="section-india-market" class="section" style="display:none;"></section>
+    <section id="section-swing" class="section" style="display:none;"></section>
+    <section id="section-us-full-report" class="section" style="display:none;"></section>
+    <section id="section-india-full-report" class="section" style="display:none;"></section>
+  </main>
+
+  <footer>
+    <p>Data sources: TradingView, Yahoo Finance, NSE/BSE &mdash; For informational purposes only, not financial advice.</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
