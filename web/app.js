@@ -5,6 +5,9 @@
   const REPORTS_BASE = '../reports';
   let reportMarkdown = '';
   let swingMarkdown = '';
+  let scanData = null;                // parsed reports/scan_data.json
+  const priceMap = { us: {}, india: {} };   // symbol → close price
+  const priceDateOk = { us: false, india: false }; // whether scan_data.fetched_dates matches current report
 
   // ── Theme Toggle ────────────────────────────────────
   const themeBtn = document.getElementById('theme-toggle');
@@ -86,13 +89,34 @@
     loading.style.display = 'flex';
     sections.forEach(s => s.innerHTML = '');
 
-    const [dailyText, swingText] = await Promise.all([
+    const [dailyText, swingText, scanJson] = await Promise.all([
       fetch(`${REPORTS_BASE}/${date}_daily.md`).then(r => r.ok ? r.text() : '').catch(() => ''),
       fetch(`${REPORTS_BASE}/${date}_swing.md`).then(r => r.ok ? r.text() : '').catch(() => ''),
+      fetch(`${REPORTS_BASE}/scan_data.json`).then(r => r.ok ? r.json() : null).catch(() => null),
     ]);
 
     reportMarkdown = dailyText.replace(/\r\n/g, '\n');
     swingMarkdown = swingText.replace(/\r\n/g, '\n');
+
+    // Build price map only when scan_data's fetched_dates match the report date,
+    // so older reports don't get mismatched "current" prices.
+    scanData = scanJson;
+    priceMap.us = {}; priceMap.india = {};
+    priceDateOk.us = false; priceDateOk.india = false;
+    if (scanData && scanData.fetched_dates) {
+      if (scanData.fetched_dates.us === date && scanData.us) {
+        priceDateOk.us = true;
+        for (const [sym, rec] of Object.entries(scanData.us)) {
+          if (rec && rec.close != null) priceMap.us[sym] = rec.close;
+        }
+      }
+      if (scanData.fetched_dates.india === date && scanData.india) {
+        priceDateOk.india = true;
+        for (const [sym, rec] of Object.entries(scanData.india)) {
+          if (rec && rec.close != null) priceMap.india[sym] = rec.close;
+        }
+      }
+    }
 
     loading.style.display = 'none';
 
@@ -108,33 +132,26 @@
 
   // ── Parse Markdown Into Sections ────────────────────
   function parseAndRender(md) {
-    // Parse sections by h2 headings
     const parts = splitByHeadings(md, 2);
 
-    // Overview (Market Overview)
     const overview = parts['Market Overview'] || parts['market overview'] || '';
     renderOverview(overview);
 
-    // Unified Recommendations (one row per stock, globally consistent label)
     const unified = findPart(parts, 'Unified Recommendations');
-    renderStrategySection('unified', 'Unified Recommendations', unified);
+    renderUnifiedRecommendations(unified);
 
-    // Top Picks
     const topPicks = findPart(parts, 'Top Picks');
     renderTopPicks(topPicks);
 
-    // Multi-bagger Watch
     const multibagger = findPart(parts, 'Multi-bagger Watch');
     renderMultibagger(multibagger);
 
-    // Sector Heatmap
     const heatmapUS = findPart(parts, 'Sector Heatmap');
     renderSectorHeatmap(heatmapUS);
 
-    // US Market — aggregate all strategy sub-sections (excluding TA Score which has its own tab)
     const usSignals = findPart(parts, 'US Market Signals');
     const usSubParts = splitByHeadings(usSignals, 3);
-    renderMarketSection('us-market', 'US Market Signals', usSubParts, {
+    renderMarketSection('us-market', 'US Market Signals', usSubParts, 'us', {
       'DMA Crossovers': 'DMA',
       'Resistance Breakouts': 'Resistance',
       'RSI Extremes': 'RSI',
@@ -143,10 +160,9 @@
       'Volume Breakouts': 'Volume',
     });
 
-    // India Market — aggregate all strategy sub-sections for India
     const indiaSignals = findPart(parts, 'India Market Signals') || findPart(parts, 'India Market');
     const indiaSubParts = splitByHeadings(indiaSignals, 3);
-    renderMarketSection('india-market', 'India Market Signals', indiaSubParts, {
+    renderMarketSection('india-market', 'India Market Signals', indiaSubParts, 'india', {
       'DMA Crossovers': 'DMA',
       'Resistance Breakouts': 'Resistance',
       'RSI Extremes': 'RSI',
@@ -155,7 +171,6 @@
       'Volume Breakouts': 'Volume',
     });
 
-    // Full Report — split into US and India tabs with filtering
     const fullReport = findPart(parts, 'Full Report');
     const fullSubParts = splitByHeadings(fullReport, 3);
     const usFullMd = findPart(fullSubParts, 'US');
@@ -163,7 +178,6 @@
     renderFilterableReport('us-full-report', 'US Full Report', usFullMd, 'us');
     renderFilterableReport('india-full-report', 'India Full Report', indiaFullMd, 'india');
 
-    // Show overview by default
     document.querySelector('.tab.active').click();
   }
 
@@ -174,10 +188,6 @@
     if (el) el.innerHTML = html;
   }
 
-  // Strategy explainer, indicator definitions, and tab descriptions live in
-  // the private repo's README.md. The dashboard itself shows data only — no
-  // methodology text — so nothing sensitive ships to GitHub Pages.
-
   function renderOverview(md) {
     if (!md) {
       renderSection('overview', '<div class="card"><p>No market overview data in this report.</p></div>');
@@ -185,7 +195,6 @@
     }
 
     const html = marked.parse(md);
-    // Try to extract index data from tables
     const tables = extractTables(md);
     let out = '<h2 style="color:var(--text-heading);margin-bottom:1rem;">Market Overview</h2>';
 
@@ -212,80 +221,470 @@
     renderSection('overview', out);
   }
 
+  // ── Price Column Injection ──────────────────────────
+
+  function formatPrice(sym, market) {
+    const m = market === 'india' ? 'india' : 'us';
+    if (!priceDateOk[m]) return '';
+    const p = priceMap[m][sym];
+    if (p == null) return '';
+    if (m === 'india') {
+      return `₹${p.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+    }
+    return `$${p.toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+  }
+
+  function inferMarketFromRow(row, fallback) {
+    const m = (row['Market'] || row['market'] || fallback || '').toString().toLowerCase();
+    if (m === 'india' || m === 'in') return 'india';
+    return 'us';
+  }
+
+  // Returns a new table with a "Price" column inserted after "Stock", when missing.
+  function injectPrice(table, defaultMarket) {
+    if (!table || !table.headers) return table;
+    const hasStock = table.headers.some(h => h.toLowerCase() === 'stock');
+    if (!hasStock) return table;
+    const lowerHeaders = table.headers.map(h => h.toLowerCase());
+    const priceAliases = ['price', 'current price', 'entry', 'entry price'];
+    if (priceAliases.some(p => lowerHeaders.includes(p))) return table;
+
+    const newHeaders = [];
+    table.headers.forEach(h => {
+      newHeaders.push(h);
+      if (h.toLowerCase() === 'stock') newHeaders.push('Price');
+    });
+    const newRows = table.rows.map(row => {
+      const sym = row['Stock'] || '';
+      const market = inferMarketFromRow(row, defaultMarket);
+      return { ...row, Price: formatPrice(sym, market) };
+    });
+    return { headers: newHeaders, rows: newRows };
+  }
+
+  // ── Filter Bar Helpers ──────────────────────────────
+  //
+  // `fields` is an array describing filter inputs. Each entry:
+  //   { key, label, type, placeholder?, options? }
+  // type is one of:
+  //   text-contains | select-action | select-sector | select-market |
+  //   select-horizon | num-min | num-max
+  // `rows` is the raw row list; each row is expected to carry the key columns
+  // (Sector, Action, Market, Stock, Score, Mkt Cap, Horizon, ...) already
+  // as strings.
+  //
+  // `onApply(filteredRows)` is called whenever any filter changes; the callback
+  // is responsible for re-rendering the display.
+
+  function buildFilterBar(fields, rows, opts) {
+    const id = opts.id;
+    const countLabel = opts.countLabel || 'rows';
+
+    const sectorSet = new Set();
+    const horizonSet = new Set();
+    const marketSet = new Set();
+    rows.forEach(r => {
+      if (r._sector) sectorSet.add(r._sector);
+      if (r.Sector) sectorSet.add(r.Sector);
+      if (r.Horizon) horizonSet.add(r.Horizon);
+      if (r.Market) marketSet.add(r.Market);
+    });
+
+    const inputsHtml = fields.map((f, idx) => {
+      const dataAttr = `data-filter-idx="${idx}"`;
+      if (f.type === 'select-action') {
+        return `<div class="filter-group">
+          <label>${f.label}</label>
+          <select ${dataAttr}>
+            <option value="">All</option>
+            <option value="STRONG BUY">STRONG BUY</option>
+            <option value="BUY">BUY</option>
+            <option value="WATCH">WATCH</option>
+            <option value="SELL">SELL</option>
+            <option value="STRONG SELL">STRONG SELL</option>
+          </select>
+        </div>`;
+      }
+      if (f.type === 'select-sector') {
+        const opts = Array.from(sectorSet).sort().map(s => `<option value="${s}">${s}</option>`).join('');
+        return `<div class="filter-group">
+          <label>${f.label}</label>
+          <select ${dataAttr}><option value="">All</option>${opts}</select>
+        </div>`;
+      }
+      if (f.type === 'select-market') {
+        const opts = Array.from(marketSet).sort().map(s => `<option value="${s}">${s}</option>`).join('');
+        return `<div class="filter-group">
+          <label>${f.label}</label>
+          <select ${dataAttr}><option value="">All</option>${opts}</select>
+        </div>`;
+      }
+      if (f.type === 'select-horizon') {
+        const opts = Array.from(horizonSet).sort().map(s => `<option value="${s}">${s}</option>`).join('');
+        return `<div class="filter-group">
+          <label>${f.label}</label>
+          <select ${dataAttr}><option value="">All</option>${opts}</select>
+        </div>`;
+      }
+      if (f.type === 'text-contains') {
+        return `<div class="filter-group">
+          <label>${f.label}</label>
+          <input type="text" ${dataAttr} placeholder="${f.placeholder || 'search'}">
+        </div>`;
+      }
+      if (f.type === 'num-min' || f.type === 'num-max') {
+        return `<div class="filter-group">
+          <label>${f.label}</label>
+          <input type="number" ${dataAttr} placeholder="${f.placeholder || ''}" step="any">
+        </div>`;
+      }
+      return '';
+    }).join('');
+
+    const html = `<div class="filter-bar" id="${id}">
+      ${inputsHtml}
+      <div class="filter-group filter-actions">
+        <button class="filter-reset">Reset</button>
+        <span class="filter-count">${rows.length} ${countLabel}</span>
+      </div>
+    </div>`;
+    return html;
+  }
+
+  function parseMktCapBytes(str) {
+    if (!str) return null;
+    const s = String(str).trim();
+    const usMatch = s.match(/^\$?([\d.]+)\s*B$/i);
+    if (usMatch) return parseFloat(usMatch[1]) * 1e9;
+    const lakhCrMatch = s.match(/^([\d.]+)\s*L\s*Cr$/i);
+    if (lakhCrMatch) return parseFloat(lakhCrMatch[1]) * 1e5 * 1e7;
+    const crMatch = s.match(/^([\d,]+)\s*Cr$/i);
+    if (crMatch) return parseFloat(crMatch[1].replace(/,/g, '')) * 1e7;
+    return null;
+  }
+
+  function parseActionText(str) {
+    if (!str) return '';
+    const tmp = document.createElement('div');
+    tmp.innerHTML = str;
+    return (tmp.textContent || '').trim().toUpperCase();
+  }
+
+  function numOrNull(str) {
+    if (str == null) return null;
+    const s = String(str).replace(/[%,\s]/g, '');
+    if (s === '' || s === '—' || s === '\u2014') return null;
+    const v = parseFloat(s);
+    return isNaN(v) ? null : v;
+  }
+
+  // Given a row with _sector/_action/_score/_mktCapBytes already populated and
+  // a fields array + filter-bar DOM, returns only the rows matching filters.
+  function applyFieldFilters(rows, fields, filterBar) {
+    return rows.filter(row => {
+      for (let i = 0; i < fields.length; i++) {
+        const f = fields[i];
+        const el = filterBar.querySelector(`[data-filter-idx="${i}"]`);
+        if (!el) continue;
+        const val = el.value;
+        if (!val) continue;
+        if (f.type === 'select-action') {
+          const action = row._action || parseActionText(row[f.key] || row['Action'] || '');
+          if (val === 'BUY' && action === 'STRONG BUY') continue;
+          if (val === 'SELL' && action === 'STRONG SELL') continue;
+          if (action !== val) return false;
+        } else if (f.type === 'select-sector') {
+          const sec = row._sector || row['Sector'] || '';
+          if (sec !== val) return false;
+        } else if (f.type === 'select-market') {
+          if ((row['Market'] || '') !== val) return false;
+        } else if (f.type === 'select-horizon') {
+          if ((row['Horizon'] || '') !== val) return false;
+        } else if (f.type === 'text-contains') {
+          const target = String(row[f.key] || '').toLowerCase();
+          if (!target.includes(val.toLowerCase())) return false;
+        } else if (f.type === 'num-min') {
+          const rv = f.key === 'Mkt Cap' ? row._mktCapBytes : numOrNull(row[f.key]);
+          let threshold = parseFloat(val);
+          if (f.key === 'Mkt Cap') {
+            // user-entered Mkt Cap min is in $B for US, Cr for India; interpret via
+            // the row's own unit by comparing parsed bytes.
+            const isIndia = /Cr$/i.test(String(row['Mkt Cap'] || ''));
+            threshold = isIndia ? threshold * 1e7 : threshold * 1e9;
+          }
+          if (rv == null || rv < threshold) return false;
+        } else if (f.type === 'num-max') {
+          const rv = numOrNull(row[f.key]);
+          const threshold = parseFloat(val);
+          if (rv == null || rv > threshold) return false;
+        }
+      }
+      return true;
+    });
+  }
+
+  function wireFilterBar(filterBarEl, onChange) {
+    filterBarEl.querySelectorAll('select, input').forEach(el => {
+      el.addEventListener('change', onChange);
+      el.addEventListener('input', onChange);
+    });
+    const resetBtn = filterBarEl.querySelector('.filter-reset');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        filterBarEl.querySelectorAll('select').forEach(s => s.value = '');
+        filterBarEl.querySelectorAll('input').forEach(i => i.value = '');
+        onChange();
+      });
+    }
+  }
+
+  function annotateRows(rows, opts) {
+    const defaultMarket = opts && opts.defaultMarket;
+    rows.forEach(row => {
+      row._sector = row['Sector'] || row['sector'] || row._sector || '';
+      row._action = parseActionText(row['Action'] || row['Signal'] || '');
+      row._score = numOrNull(row['Score']);
+      row._mktCapBytes = parseMktCapBytes(row['Mkt Cap']);
+      if (!row['Market'] && defaultMarket) {
+        row['Market'] = defaultMarket === 'india' ? 'India' : 'US';
+      }
+    });
+  }
+
+  // ── Shared Table Rendering ──────────────────────────
+
+  // Render a single HTML-string table. Always wraps in .table-wrapper.
+  function renderSimpleTable(headers, rows) {
+    return `<div class="table-wrapper">
+      <table>
+        <thead><tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+        <tbody>${rows.map(row =>
+          `<tr>${headers.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`
+        ).join('')}</tbody>
+      </table>
+    </div>`;
+  }
+
+  // Render a table as a set of collapsible sector <details>. If there is no
+  // Sector column on the table, falls back to a single table with no grouping.
+  function renderSectorGroupedTable(table, opts) {
+    opts = opts || {};
+    const hasSector = table.headers.some(h => h.toLowerCase() === 'sector');
+    if (!hasSector) {
+      return renderSimpleTable(table.headers, table.rows);
+    }
+    const groups = {};
+    table.rows.forEach(row => {
+      const sector = row['Sector'] || row['sector'] || 'Other';
+      if (!groups[sector]) groups[sector] = [];
+      groups[sector].push(row);
+    });
+    const displayHeaders = table.headers.filter(h => h.toLowerCase() !== 'sector');
+    const sectorNames = Object.keys(groups).sort();
+    return sectorNames.map(sector => {
+      const rows = groups[sector];
+      return `<details class="sector-details" ${opts.open !== false ? 'open' : ''}>
+        <summary>
+          <h4 style="display:inline;color:var(--accent);margin:0;font-size:0.95rem;">${sector}</h4>
+          <span class="count">${rows.length} ${opts.countLabel || 'row' + (rows.length !== 1 ? 's' : '')}</span>
+        </summary>
+        ${renderSimpleTable(displayHeaders, rows)}
+      </details>`;
+    }).join('');
+  }
+
+  // ── Unified Recommendations ─────────────────────────
+
+  function renderUnifiedRecommendations(md) {
+    if (!md) {
+      renderSection('unified', '<div class="card"><h2>Unified Recommendations</h2><p>No signals in this section.</p></div>');
+      return;
+    }
+    const tables = extractTables(md);
+    if (tables.length === 0) {
+      renderSection('unified', `<div class="card markdown-body">${marked.parse(md)}</div>`);
+      return;
+    }
+    const rawTable = tables[0];
+    // Enrich with Price column using row's Market column (US vs India)
+    const enriched = injectPrice(rawTable, null);
+    annotateRows(enriched.rows);
+
+    const filterId = 'filter-unified';
+    const fields = [
+      { key: 'Action', label: 'Action', type: 'select-action' },
+      { key: 'Market', label: 'Market', type: 'select-market' },
+      { key: 'Sector', label: 'Sector', type: 'select-sector' },
+      { key: 'Horizon', label: 'Horizon', type: 'select-horizon' },
+      { key: 'Score', label: 'Score ≥', type: 'num-min', placeholder: 'e.g. 10' },
+      { key: 'Mkt Cap', label: 'Mkt Cap ≥', type: 'num-min', placeholder: '$B / Cr' },
+      { key: 'Stock', label: 'Stock contains', type: 'text-contains', placeholder: 'e.g. NVDA' },
+    ];
+
+    let out = '<h2 style="color:var(--text-heading);margin-bottom:1rem;">Unified Recommendations</h2>';
+    out += `<p style="color:var(--text-muted);margin-bottom:1rem;">STRONG BUY names from both markets, ranked by composite score. Grouped by sector (click to expand/collapse). Use the filter bar to narrow down.</p>`;
+    out += buildFilterBar(fields, enriched.rows, { id: filterId, countLabel: 'stocks' });
+    out += `<div id="unified-body"></div>`;
+    renderSection('unified', out);
+
+    const filterBar = document.getElementById(filterId);
+    const bodyEl = document.getElementById('unified-body');
+    const countEl = filterBar.querySelector('.filter-count');
+
+    function reRender() {
+      const filtered = applyFieldFilters(enriched.rows, fields, filterBar);
+      countEl.textContent = `${filtered.length} / ${enriched.rows.length} stocks`;
+      if (filtered.length === 0) {
+        bodyEl.innerHTML = '<div class="card"><p>No stocks match the current filters.</p></div>';
+        return;
+      }
+      const bySector = {};
+      filtered.forEach(r => {
+        const s = r['Sector'] || 'Other';
+        (bySector[s] = bySector[s] || []).push(r);
+      });
+      const sectorList = Object.keys(bySector).sort();
+      const displayHeaders = enriched.headers.filter(h => h.toLowerCase() !== 'sector');
+      bodyEl.innerHTML = sectorList.map(sector => {
+        const rows = bySector[sector];
+        return `<details class="market-strategy" open>
+          <summary>
+            <h3 style="display:inline;color:var(--accent);margin:0;">${sector}</h3>
+            <span class="count">${rows.length} stock${rows.length !== 1 ? 's' : ''}</span>
+          </summary>
+          ${renderSimpleTable(displayHeaders, rows)}
+        </details>`;
+      }).join('');
+    }
+
+    wireFilterBar(filterBar, reRender);
+    reRender();
+  }
+
+  // ── Top Picks ───────────────────────────────────────
+
   function renderTopPicks(md) {
     if (!md) {
       renderSection('top-picks', '<div class="card"><p>No top picks data in this report.</p></div>');
       return;
     }
-
     const subParts = splitByHeadings(md, 3);
     let out = '<h2 style="color:var(--text-heading);margin-bottom:1rem;">Top Picks</h2>';
-    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">Up to 50 best-buy candidates per market. Gated on: label BUY/STRONG BUY, quality grade ≠ F, ≥2 strategies, RSI ≤ 70, ADX ≥ 20, 3mo return ≤ 40%, avg turnover ≥ $5M / ₹2Cr. Ranked by composite score with bonuses for multi-strategy agreement and MEDIUM (30-90d) horizon; soft-capped at 10 per sector.</p>';
+    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">Up to 50 best-buy candidates per market (30-90 day swing horizon). Gated on: label BUY/STRONG BUY, quality grade ≠ F, ≥2 strategies, RSI ≤ 70, ADX ≥ 20, 3mo return ≤ 40%, liquidity. Ranked by composite score; soft-capped at 10 per sector.</p>';
 
-    // Render each market sub-section (e.g. "US — Top 10", "India — Top 10")
+    // Gather all rows and tag each with Market inferred from its heading.
+    const allRows = [];
     const marketKeys = Object.keys(subParts);
-    if (marketKeys.length > 0) {
-      for (const heading of marketKeys) {
-        const sectionMd = subParts[heading];
-        const tables = extractTables(sectionMd);
-        if (tables.length === 0 || tables[0].rows.length === 0) continue;
-
-        out += `<details class="market-strategy" open>
-          <summary><h3 style="display:inline;color:var(--accent);margin:0;">${heading}</h3>
-          <span class="count">${tables[0].rows.length} pick${tables[0].rows.length !== 1 ? 's' : ''}</span></summary>
-          <div style="padding:0.5rem 1rem;">`;
-        tables[0].rows.forEach((row, i) => {
-          const strategies = row['Strategies Triggered'] || row['strategies triggered'] || '';
-          const badges = strategies.split(',').map(s => s.trim()).filter(Boolean)
-            .map(s => `<span class="badge badge-buy">${s}</span>`).join(' ');
-          const mcap = row['Mkt Cap'] || '';
-          const mcapHtml = mcap ? `<span style="color:var(--text-muted);font-size:0.8rem;margin-left:0.5rem;">${mcap}</span>` : '';
-          const score = row['Score'] || '';
-          const scoreNum = parseFloat(score);
-          const scoreClass = !isNaN(scoreNum) ? (scoreNum > 0 ? 'positive' : scoreNum < 0 ? 'negative' : '') : '';
-          const scoreHtml = score ? `<span class="index-change ${scoreClass}" style="font-size:0.85rem;font-weight:600;">${score}</span>` : '';
-
-          out += `
-            <div class="top-pick">
-              <div class="rank">#${row['Rank'] || i + 1}</div>
-              <div class="stock-info">
-                <div class="stock-name">${row['Stock'] || ''}${mcapHtml}</div>
-                <div class="stock-sector">${row['Sector'] || ''}</div>
-              </div>
-              <div style="text-align:center;min-width:3rem;">${scoreHtml}</div>
-              <div class="strategies">${badges}</div>
-              <div>${actionBadge(row['Action'] || '')}</div>
-            </div>`;
-        });
-        out += '</div></details>';
-      }
-    } else {
-      // Fallback: single table without h3 sub-headings
-      const tables = extractTables(md);
-      if (tables.length > 0 && tables[0].rows.length > 0) {
-        tables[0].rows.forEach((row, i) => {
-          const strategies = row['Strategies Triggered'] || row['strategies triggered'] || '';
-          const badges = strategies.split(',').map(s => s.trim()).filter(Boolean)
-            .map(s => `<span class="badge badge-buy">${s}</span>`).join(' ');
-
-          out += `
-            <div class="top-pick">
-              <div class="rank">#${row['Rank'] || i + 1}</div>
-              <div class="stock-info">
-                <div class="stock-name">${row['Stock'] || ''} <span style="color:var(--text-muted);font-weight:400;font-size:0.85rem;">${row['Market'] || ''}</span></div>
-                <div class="stock-sector">${row['Sector'] || ''}</div>
-              </div>
-              <div class="strategies">${badges}</div>
-              <div>${actionBadge(row['Action'] || '')}</div>
-            </div>`;
-        });
-      } else {
-        out += `<div class="card markdown-body">${marked.parse(md)}</div>`;
-      }
+    for (const heading of marketKeys) {
+      const sectionMd = subParts[heading];
+      const tables = extractTables(sectionMd);
+      if (tables.length === 0 || tables[0].rows.length === 0) continue;
+      const headingLower = heading.toLowerCase();
+      const market = headingLower.startsWith('india') ? 'India' : 'US';
+      const defaultMarket = market === 'India' ? 'india' : 'us';
+      const enriched = injectPrice(tables[0], defaultMarket);
+      enriched.rows.forEach(row => {
+        row['Market'] = market;
+        row['_market_default'] = defaultMarket;
+        allRows.push(row);
+      });
     }
 
+    if (allRows.length === 0) {
+      out += '<div class="card"><p>No top picks in this report.</p></div>';
+      renderSection('top-picks', out);
+      return;
+    }
+    annotateRows(allRows);
+
+    const filterId = 'filter-top-picks';
+    const fields = [
+      { key: 'Action', label: 'Action', type: 'select-action' },
+      { key: 'Market', label: 'Market', type: 'select-market' },
+      { key: 'Sector', label: 'Sector', type: 'select-sector' },
+      { key: 'Score', label: 'Score ≥', type: 'num-min', placeholder: 'e.g. 10' },
+      { key: 'Stock', label: 'Stock contains', type: 'text-contains', placeholder: 'e.g. NVDA' },
+    ];
+    out += buildFilterBar(fields, allRows, { id: filterId, countLabel: 'picks' });
+    out += `<div id="top-picks-body"></div>`;
     renderSection('top-picks', out);
+
+    const filterBar = document.getElementById(filterId);
+    const bodyEl = document.getElementById('top-picks-body');
+    const countEl = filterBar.querySelector('.filter-count');
+
+    function rowToCard(row, i) {
+      const strategies = row['Strategies Triggered'] || row['strategies triggered'] || '';
+      const badges = strategies.split(',').map(s => s.trim()).filter(Boolean)
+        .map(s => `<span class="badge badge-buy">${s}</span>`).join(' ');
+      const mcap = row['Mkt Cap'] || '';
+      const mcapHtml = mcap ? `<span style="color:var(--text-muted);font-size:0.8rem;margin-left:0.5rem;">${mcap}</span>` : '';
+      const score = row['Score'] || '';
+      const scoreNum = parseFloat(score);
+      const scoreClass = !isNaN(scoreNum) ? (scoreNum > 0 ? 'positive' : scoreNum < 0 ? 'negative' : '') : '';
+      const scoreHtml = score ? `<span class="index-change ${scoreClass}" style="font-size:0.85rem;font-weight:600;">${score}</span>` : '';
+      const price = row['Price'] || '';
+      const priceHtml = price ? `<div style="font-size:0.82rem;color:var(--text-heading);font-family:var(--font-mono);min-width:5rem;text-align:right;">${price}</div>` : '';
+      return `
+        <div class="top-pick">
+          <div class="rank">#${row['Rank'] || i + 1}</div>
+          <div class="stock-info">
+            <div class="stock-name">${row['Stock'] || ''}${mcapHtml}</div>
+            <div class="stock-sector">${row['Sector'] || ''} <span style="color:var(--text-muted);">· ${row['Market']}</span></div>
+          </div>
+          ${priceHtml}
+          <div style="text-align:center;min-width:3rem;">${scoreHtml}</div>
+          <div class="strategies">${badges}</div>
+          <div>${actionBadge(row['Action'] || '')}</div>
+        </div>`;
+    }
+
+    function reRender() {
+      const filtered = applyFieldFilters(allRows, fields, filterBar);
+      countEl.textContent = `${filtered.length} / ${allRows.length} picks`;
+      if (filtered.length === 0) {
+        bodyEl.innerHTML = '<div class="card"><p>No picks match the current filters.</p></div>';
+        return;
+      }
+      // Group by Market → Sector
+      const byMarket = {};
+      filtered.forEach(r => {
+        const mk = r['Market'] || 'US';
+        if (!byMarket[mk]) byMarket[mk] = {};
+        const sec = r['Sector'] || 'Other';
+        (byMarket[mk][sec] = byMarket[mk][sec] || []).push(r);
+      });
+      const markets = Object.keys(byMarket).sort();
+      bodyEl.innerHTML = markets.map(mk => {
+        const sectors = Object.keys(byMarket[mk]).sort();
+        const totalCount = sectors.reduce((n, s) => n + byMarket[mk][s].length, 0);
+        const sectorHtml = sectors.map(sector => {
+          const rows = byMarket[mk][sector];
+          return `<details class="sector-details" open>
+            <summary>
+              <h4 style="display:inline;color:var(--accent);margin:0;font-size:0.95rem;">${sector}</h4>
+              <span class="count">${rows.length} pick${rows.length !== 1 ? 's' : ''}</span>
+            </summary>
+            <div style="padding:0.5rem 1rem;">
+              ${rows.map((r, i) => rowToCard(r, i)).join('')}
+            </div>
+          </details>`;
+        }).join('');
+        return `<details class="market-strategy" open>
+          <summary>
+            <h3 style="display:inline;color:var(--accent);margin:0;">${mk} — Top Picks</h3>
+            <span class="count">${totalCount} pick${totalCount !== 1 ? 's' : ''}</span>
+          </summary>
+          <div style="padding:0.5rem 1rem;">${sectorHtml}</div>
+        </details>`;
+      }).join('');
+    }
+
+    wireFilterBar(filterBar, reRender);
+    reRender();
   }
+
+  // ── Multi-bagger Watch ──────────────────────────────
 
   function renderMultibagger(md) {
     if (!md) {
@@ -295,7 +694,34 @@
 
     const subParts = splitByHeadings(md, 3);
     let out = '<h2 style="color:var(--text-heading);margin-bottom:1rem;">Multi-bagger Watch</h2>';
-    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">Names that look early in their momentum phase. <strong>Multi-bagger Early</strong>: passes the strict gate (mid-cap + accelerating revenue & earnings + stage-2 trend + accumulation + relative strength + not-extended + quality grade ≠ F). <strong>Quad Green</strong>: 1D + 5D + 15D + 30D returns all positive AND OBV trending up. <strong>Streak 15D</strong>: 3 of 4 timeframes positive (lower-conviction flag).</p>';
+    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">Names that look early in their momentum phase. <strong>Multi-bagger Early</strong>: passes the strict gate. <strong>Quad Green</strong>: 1D+5D+15D+30D positive AND OBV trending up. <strong>Streak 15D</strong>: 3 of 4 timeframes positive.</p>';
+
+    const marketBuckets = {
+      US: ['US — Multi-bagger Early', 'US — Quad Green', 'US — Streak 15D'],
+      India: ['India — Multi-bagger Early', 'India — Quad Green', 'India — Streak 15D'],
+    };
+    const matchHeading = (heading) => Object.keys(subParts).find(k =>
+      k.replace(/\s+/g, ' ').trim() === heading ||
+      k.replace(/—|-/g, '').replace(/\s+/g, ' ').trim() === heading.replace(/—|-/g, '').replace(/\s+/g, ' ').trim()
+    );
+
+    // Pre-build a rows-per-bucket structure so filters can re-render
+    // without reparsing the markdown.
+    const bucketRows = { US: {}, India: {} };
+    for (const mk of ['US', 'India']) {
+      const defaultMarket = mk === 'India' ? 'india' : 'us';
+      for (const heading of marketBuckets[mk]) {
+        const matched = matchHeading(heading);
+        if (!matched) continue;
+        const tables = extractTables(subParts[matched]);
+        if (tables.length === 0) continue;
+        const enriched = injectPrice(tables[0], defaultMarket);
+        const rows = enriched.rows.filter(r => r['Stock']);
+        rows.forEach(row => { row['Market'] = mk; });
+        annotateRows(rows, { defaultMarket: mk });
+        bucketRows[mk][heading] = { rows, headers: enriched.headers };
+      }
+    }
 
     const renderReturn = (val) => {
       if (val === undefined || val === null || val === '') return '<span style="color:var(--text-muted);">—</span>';
@@ -309,7 +735,6 @@
 
     const renderBadges = (badgeStr) => {
       if (!badgeStr || badgeStr === '—') return '';
-      // Badges come in as backtick-wrapped tokens: `MULTIBAGGER` `QUAD GREEN` `VOL+` `ACCUM`
       const tokens = (badgeStr.match(/`([^`]+)`/g) || []).map(t => t.replace(/`/g, ''));
       return tokens.map(tok => {
         const lower = tok.toLowerCase();
@@ -323,64 +748,66 @@
       }).join('');
     };
 
-    const renderBucket = (heading, tableMd) => {
-      // Strip "US — " / "India — " prefix since the sub-tab already indicates market
-      const shortHeading = heading.replace(/^(US|India)\s*[—-]\s*/, '');
-      const tables = extractTables(tableMd);
-      if (tables.length === 0 || tables[0].rows.length === 0) return '';
-      const empty = tables[0].rows.every(r => !r['Stock'] || /No qualifying names/.test(Object.values(r).join(' ')));
-      if (empty) {
-        return `<details class="market-strategy" open>
-          <summary><h3 style="display:inline;color:var(--accent);margin:0;">${shortHeading}</h3>
-          <span class="count">0 names</span></summary>
-          <div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);margin:0.5rem 1rem;">No qualifying names today.</div>
-        </details>`;
+    const tableHeaders = ['Rank', 'Stock', 'Price', 'Sector', 'Mkt Cap', 'Score', '1D', '5D', '15D', '30D', 'Badges', 'Action'];
+
+    const renderBucketBody = (filtered) => {
+      if (filtered.length === 0) {
+        return `<div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);margin:0.5rem 1rem;">No names match filters in this bucket.</div>`;
       }
-      const rowCount = tables[0].rows.filter(r => r['Stock']).length;
-      let html = `<details class="market-strategy" open>
-        <summary><h3 style="display:inline;color:var(--accent);margin:0;">${shortHeading}</h3>
-        <span class="count">${rowCount} name${rowCount !== 1 ? 's' : ''}</span></summary>`;
-      html += '<div class="card" style="padding:0;overflow-x:auto;margin:0.5rem 1rem;"><table class="data-table" style="width:100%;border-collapse:collapse;">';
-      html += '<thead><tr>'
-        + ['Rank','Stock','Sector','Mkt Cap','Score','1D','5D','15D','30D','Badges','Action']
-          .map(h => `<th style="text-align:left;padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${h}</th>`).join('')
-        + '</tr></thead><tbody>';
-      tables[0].rows.forEach((row, i) => {
-        if (!row['Stock']) return;
-        html += '<tr>'
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${row['Rank'] || i + 1}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);font-weight:600;">${row['Stock']}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);color:var(--text-muted);">${row['Sector'] || ''}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);color:var(--text-muted);">${row['Mkt Cap'] || ''}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${row['Score'] || ''}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderReturn(row['1D'])}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderReturn(row['5D'])}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderReturn(row['15D'])}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderReturn(row['30D'])}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderBadges(row['Badges'] || '')}</td>`
-          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${actionBadge(row['Action'] || '')}</td>`
-          + '</tr>';
+      // Group by Sector
+      const bySector = {};
+      filtered.forEach(r => {
+        const s = r['Sector'] || 'Other';
+        (bySector[s] = bySector[s] || []).push(r);
       });
-      html += '</tbody></table></div></details>';
-      return html;
+      const sectorList = Object.keys(bySector).sort();
+      return sectorList.map(sector => {
+        const rows = bySector[sector];
+        const inner = `<div class="table-wrapper"><table><thead><tr>${tableHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead><tbody>` +
+          rows.map((row, i) => {
+            return '<tr>' +
+              `<td>${row['Rank'] || i + 1}</td>` +
+              `<td style="font-weight:600;">${row['Stock']}</td>` +
+              `<td style="color:var(--text-heading);">${row['Price'] || ''}</td>` +
+              `<td style="color:var(--text-muted);">${row['Sector'] || ''}</td>` +
+              `<td style="color:var(--text-muted);">${row['Mkt Cap'] || ''}</td>` +
+              `<td>${row['Score'] || ''}</td>` +
+              `<td>${renderReturn(row['1D'])}</td>` +
+              `<td>${renderReturn(row['5D'])}</td>` +
+              `<td>${renderReturn(row['15D'])}</td>` +
+              `<td>${renderReturn(row['30D'])}</td>` +
+              `<td>${renderBadges(row['Badges'] || '')}</td>` +
+              `<td>${actionBadge(row['Action'] || '')}</td>` +
+              '</tr>';
+          }).join('') + '</tbody></table></div>';
+        return `<details class="sector-details" open>
+          <summary>
+            <h4 style="display:inline;color:var(--accent);margin:0;font-size:0.95rem;">${sector}</h4>
+            <span class="count">${rows.length} name${rows.length !== 1 ? 's' : ''}</span>
+          </summary>
+          ${inner}
+        </details>`;
+      }).join('');
     };
 
-    // Split buckets by market so we can render them under separate sub-tabs.
-    const marketBuckets = {
-      US: ['US — Multi-bagger Early', 'US — Quad Green', 'US — Streak 15D'],
-      India: ['India — Multi-bagger Early', 'India — Quad Green', 'India — Streak 15D'],
-    };
-    const matchHeading = (heading) => Object.keys(subParts).find(k =>
-      k.replace(/\s+/g, ' ').trim() === heading ||
-      k.replace(/—|-/g, '').replace(/\s+/g, ' ').trim() === heading.replace(/—|-/g, '').replace(/\s+/g, ' ').trim()
-    );
-    const renderMarket = (market) => {
-      let html = '';
-      for (const heading of marketBuckets[market]) {
-        const match = matchHeading(heading);
-        if (match) html += renderBucket(heading, subParts[match]);
+    // Per-market filter bar + panel
+    const renderMarketPanel = (marketKey) => {
+      const allBucketRows = [];
+      for (const heading of marketBuckets[marketKey]) {
+        if (bucketRows[marketKey][heading]) {
+          bucketRows[marketKey][heading].rows.forEach(r => allBucketRows.push(r));
+        }
       }
-      return html || '<div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);">No data for this market.</div>';
+      const filterId = `filter-mb-${marketKey.toLowerCase()}`;
+      const bodyId = `mb-body-${marketKey.toLowerCase()}`;
+      const fields = [
+        { key: 'Action', label: 'Action', type: 'select-action' },
+        { key: 'Sector', label: 'Sector', type: 'select-sector' },
+        { key: 'Score', label: 'Score ≥', type: 'num-min', placeholder: 'e.g. 5' },
+        { key: 'Stock', label: 'Stock contains', type: 'text-contains', placeholder: 'e.g. NVDA' },
+      ];
+      const bar = buildFilterBar(fields, allBucketRows, { id: filterId, countLabel: 'names' });
+      return `${bar}<div id="${bodyId}"></div>`;
     };
 
     out += `
@@ -388,26 +815,72 @@
         <button class="tab active" data-mb-market="US">US</button>
         <button class="tab" data-mb-market="India">India</button>
       </div>
-      <div class="mb-panel" data-mb-panel="US">${renderMarket('US')}</div>
-      <div class="mb-panel" data-mb-panel="India" style="display:none;">${renderMarket('India')}</div>
+      <div class="mb-panel" data-mb-panel="US">${renderMarketPanel('US')}</div>
+      <div class="mb-panel" data-mb-panel="India" style="display:none;">${renderMarketPanel('India')}</div>
     `;
 
     renderSection('multibagger', out);
 
-    // Wire up sub-tab toggle
+    // Wire up filter bars + sub-tabs
     const root = document.getElementById('section-multibagger');
-    if (root) {
-      root.querySelectorAll('[data-mb-market]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const market = btn.getAttribute('data-mb-market');
-          root.querySelectorAll('[data-mb-market]').forEach(b =>
-            b.classList.toggle('active', b.getAttribute('data-mb-market') === market));
-          root.querySelectorAll('[data-mb-panel]').forEach(p =>
-            p.style.display = p.getAttribute('data-mb-panel') === market ? '' : 'none');
-        });
-      });
+    if (!root) return;
+
+    for (const mk of ['US', 'India']) {
+      const filterId = `filter-mb-${mk.toLowerCase()}`;
+      const bodyId = `mb-body-${mk.toLowerCase()}`;
+      const filterBar = document.getElementById(filterId);
+      const bodyEl = document.getElementById(bodyId);
+      if (!filterBar || !bodyEl) continue;
+      const countEl = filterBar.querySelector('.filter-count');
+
+      const fields = [
+        { key: 'Action', label: 'Action', type: 'select-action' },
+        { key: 'Sector', label: 'Sector', type: 'select-sector' },
+        { key: 'Score', label: 'Score ≥', type: 'num-min' },
+        { key: 'Stock', label: 'Stock contains', type: 'text-contains' },
+      ];
+
+      const totalRows = marketBuckets[mk].reduce((n, h) => n + ((bucketRows[mk][h] && bucketRows[mk][h].rows.length) || 0), 0);
+
+      function reRender() {
+        let shownTotal = 0;
+        const html = marketBuckets[mk].map(heading => {
+          const shortHeading = heading.replace(/^(US|India)\s*[—-]\s*/, '');
+          const bucket = bucketRows[mk][heading];
+          if (!bucket) {
+            return `<details class="market-strategy" open>
+              <summary><h3 style="display:inline;color:var(--accent);margin:0;">${shortHeading}</h3>
+              <span class="count">0 names</span></summary>
+              <div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);margin:0.5rem 1rem;">No qualifying names today.</div>
+            </details>`;
+          }
+          const filtered = applyFieldFilters(bucket.rows, fields, filterBar);
+          shownTotal += filtered.length;
+          return `<details class="market-strategy" open>
+            <summary><h3 style="display:inline;color:var(--accent);margin:0;">${shortHeading}</h3>
+            <span class="count">${filtered.length} / ${bucket.rows.length} name${bucket.rows.length !== 1 ? 's' : ''}</span></summary>
+            ${renderBucketBody(filtered)}
+          </details>`;
+        }).join('');
+        countEl.textContent = `${shownTotal} / ${totalRows} names`;
+        bodyEl.innerHTML = html;
+      }
+      wireFilterBar(filterBar, reRender);
+      reRender();
     }
+
+    root.querySelectorAll('[data-mb-market]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const market = btn.getAttribute('data-mb-market');
+        root.querySelectorAll('[data-mb-market]').forEach(b =>
+          b.classList.toggle('active', b.getAttribute('data-mb-market') === market));
+        root.querySelectorAll('[data-mb-panel]').forEach(p =>
+          p.style.display = p.getAttribute('data-mb-panel') === market ? '' : 'none');
+      });
+    });
   }
+
+  // ── Sector Heatmap ──────────────────────────────────
 
   function renderSectorHeatmap(md) {
     if (!md) {
@@ -449,15 +922,15 @@
     renderSection('sector-heatmap', out);
   }
 
-  // Render a whole market tab (US or India) as a stack of strategy sub-sections.
-  // `subParts` is the h3 split of the market's markdown; `strategyMap` is
-  // { 'Display Title': 'keywordFallback' } in render order.
-  function renderMarketSection(id, title, subParts, strategyMap) {
-    let out = `<h2 style="color:var(--text-heading);margin-bottom:1rem;">${title}</h2>`;
-    let anySignals = false;
+  // ── Market Signals (US / India) ─────────────────────
+
+  function renderMarketSection(id, title, subParts, defaultMarket, strategyMap) {
+    // Collect strategy tables in order, enrich with price, and gather all rows
+    // for the cross-strategy filter bar.
+    const strategies = [];  // [{title, headers, rows}]
+    const allRows = [];
 
     for (const [displayTitle, keyword] of Object.entries(strategyMap)) {
-      // Match heading: exact, endsWith (to handle "NSE/BSE — DMA Crossovers"), or keyword
       let content = subParts[displayTitle];
       if (!content) {
         const key = Object.keys(subParts).find(k =>
@@ -469,62 +942,64 @@
       const tables = extractTables(content);
       const hasRows = tables.some(t => t.rows.length > 0);
       if (!hasRows) continue;
-      anySignals = true;
-
-      out += `<details class="market-strategy" open>
-        <summary><h3 style="display:inline;color:var(--accent);margin:0;">${displayTitle}</h3>
-        <span class="count">${tables[0].rows.length} signal${tables[0].rows.length !== 1 ? 's' : ''}</span></summary>`;
-      out += renderStrategyTablesHtml(tables);
-      out += '</details>';
+      // Only first table per strategy section (strategies always emit a single
+      // table). Enrich with price; tag rows with strategy for filtering.
+      const enriched = injectPrice(tables[0], defaultMarket);
+      enriched.rows.forEach(row => {
+        row._strategy = displayTitle;
+      });
+      annotateRows(enriched.rows, { defaultMarket });
+      strategies.push({ title: displayTitle, headers: enriched.headers, rows: enriched.rows });
+      enriched.rows.forEach(r => allRows.push(r));
     }
 
-    if (!anySignals) {
-      out += '<div class="card"><p>No signals in this market today.</p></div>';
+    if (strategies.length === 0) {
+      renderSection(id, `<h2 style="color:var(--text-heading);margin-bottom:1rem;">${title}</h2>
+        <div class="card"><p>No signals in this market today.</p></div>`);
+      return;
     }
+
+    const filterId = `filter-${id}`;
+    const fields = [
+      { key: 'Action', label: 'Action', type: 'select-action' },
+      { key: 'Sector', label: 'Sector', type: 'select-sector' },
+      { key: 'Stock', label: 'Stock contains', type: 'text-contains', placeholder: 'e.g. NVDA' },
+    ];
+
+    let out = `<h2 style="color:var(--text-heading);margin-bottom:1rem;">${title}</h2>`;
+    out += buildFilterBar(fields, allRows, { id: filterId, countLabel: 'signals' });
+    out += `<div id="${id}-body"></div>`;
     renderSection(id, out);
+
+    const filterBar = document.getElementById(filterId);
+    const bodyEl = document.getElementById(`${id}-body`);
+    const countEl = filterBar.querySelector('.filter-count');
+
+    function reRender() {
+      let totalShown = 0;
+      const html = strategies.map(strat => {
+        const filtered = applyFieldFilters(strat.rows, fields, filterBar);
+        totalShown += filtered.length;
+        const tbl = { headers: strat.headers, rows: filtered };
+        const inner = filtered.length === 0
+          ? `<div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);margin:0.5rem 1rem;">No signals match the current filters.</div>`
+          : renderSectorGroupedTable(tbl, { countLabel: 'signal' + (filtered.length !== 1 ? 's' : '') });
+        return `<details class="market-strategy" open>
+          <summary>
+            <h3 style="display:inline;color:var(--accent);margin:0;">${strat.title}</h3>
+            <span class="count">${filtered.length} / ${strat.rows.length} signal${strat.rows.length !== 1 ? 's' : ''}</span>
+          </summary>
+          ${inner}
+        </details>`;
+      }).join('');
+      countEl.textContent = `${totalShown} / ${allRows.length} signals`;
+      bodyEl.innerHTML = html;
+    }
+    wireFilterBar(filterBar, reRender);
+    reRender();
   }
 
-  // Render the inner tables (with optional sector grouping) for a strategy section.
-  // Extracted so both renderMarketSection and renderStrategySection can share it.
-  function renderStrategyTablesHtml(tables) {
-    let out = '';
-    tables.forEach(table => {
-      const hasSector = table.headers.some(h => h.toLowerCase() === 'sector');
-      if (hasSector) {
-        const groups = {};
-        table.rows.forEach(row => {
-          const sector = row['Sector'] || row['sector'] || 'Other';
-          if (!groups[sector]) groups[sector] = [];
-          groups[sector].push(row);
-        });
-        const otherHeaders = table.headers.filter(h => h.toLowerCase() !== 'sector');
-        for (const [sector, rows] of Object.entries(groups)) {
-          out += `
-            <div class="sector-group">
-              <div class="sector-group-header">
-                <h4 style="margin:0;">${sector}</h4>
-                <span class="count">${rows.length} signal${rows.length !== 1 ? 's' : ''}</span>
-              </div>
-              <div class="table-wrapper">
-                <table>
-                  <thead><tr>${otherHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-                  <tbody>${rows.map(row => `<tr>${otherHeaders.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`).join('')}</tbody>
-                </table>
-              </div>
-            </div>`;
-        }
-      } else {
-        out += `
-          <div class="table-wrapper">
-            <table>
-              <thead><tr>${table.headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-              <tbody>${table.rows.map(row => `<tr>${table.headers.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`).join('')}</tbody>
-            </table>
-          </div>`;
-      }
-    });
-    return out;
-  }
+  // ── Swing Trades ────────────────────────────────────
 
   function renderSwing(md) {
     if (!md) {
@@ -558,120 +1033,86 @@
       }
     }
 
-    for (const [heading, mdBlock] of [['US Swing Trades', usMd], ['India Swing Trades', indiaMd]]) {
-      const tables = extractTables(mdBlock);
+    // Gather rows for each market for filter bar
+    const markets = [
+      { key: 'us', label: 'US Swing Trades', md: usMd },
+      { key: 'india', label: 'India Swing Trades', md: indiaMd },
+    ];
+    const marketTables = {};
+    const allSwingRows = [];
+    for (const mk of markets) {
+      const tables = extractTables(mk.md || '');
       if (tables.length === 0 || tables[0].rows.length === 0) {
-        out += `<details class="market-strategy" open>
-          <summary><h3 style="display:inline;color:var(--accent);margin:0;">${heading}</h3>
-          <span class="count">0 setups</span></summary>
-          <div class="card" style="margin:0.5rem 1rem;"><p>No setups in this market today.</p></div>
-        </details>`;
+        marketTables[mk.key] = null;
         continue;
       }
-      const setupCount = tables.reduce((n, t) => n + t.rows.length, 0);
-      out += `<details class="market-strategy" open>
-        <summary><h3 style="display:inline;color:var(--accent);margin:0;">${heading}</h3>
-        <span class="count">${setupCount} setup${setupCount !== 1 ? 's' : ''}</span></summary>`;
-      out += renderStrategyTablesHtml(tables);
-      out += '</details>';
+      // Swing tables already have "Entry" which is effectively the current price,
+      // so don't inject. Just annotate.
+      tables[0].rows.forEach(row => {
+        row['Market'] = mk.key === 'india' ? 'India' : 'US';
+      });
+      annotateRows(tables[0].rows, { defaultMarket: mk.key });
+      marketTables[mk.key] = tables[0];
+      tables[0].rows.forEach(r => allSwingRows.push(r));
     }
 
-    if (methodology) {
-      out += `<div class="card markdown-body" style="margin-top:1rem;">${marked.parse(methodology)}</div>`;
-    }
-
-    renderSection('swing', out);
-  }
-
-  function renderStrategySection(id, title, md) {
-    if (!md) {
-      renderSection(id, `<div class="card"><h2>${title}</h2><p>No signals in this section.</p></div>`);
+    if (allSwingRows.length === 0) {
+      out += '<div class="card"><p>No swing setups in this report.</p></div>';
+      if (methodology) out += `<div class="card markdown-body" style="margin-top:1rem;">${marked.parse(methodology)}</div>`;
+      renderSection('swing', out);
       return;
     }
 
-    const tables = extractTables(md);
-    let out = `<h2 style="color:var(--text-heading);margin-bottom:1rem;">${title}</h2>`;
+    const filterId = 'filter-swing';
+    const fields = [
+      { key: 'Market', label: 'Market', type: 'select-market' },
+      { key: 'Sector', label: 'Sector', type: 'select-sector' },
+      { key: 'R:R', label: 'R:R ≥', type: 'num-min', placeholder: 'e.g. 1.5' },
+      { key: 'Stock', label: 'Stock contains', type: 'text-contains', placeholder: 'e.g. NVDA' },
+    ];
+    out += buildFilterBar(fields, allSwingRows, { id: filterId, countLabel: 'setups' });
+    out += `<div id="swing-body"></div>`;
+    if (methodology) {
+      out += `<div class="card markdown-body" style="margin-top:1rem;">${marked.parse(methodology)}</div>`;
+    }
+    renderSection('swing', out);
 
-    if (tables.length > 0) {
-      tables.forEach(table => {
-        // Group by sector if Sector column exists
-        const hasSector = table.headers.some(h => h.toLowerCase() === 'sector');
+    const filterBar = document.getElementById(filterId);
+    const bodyEl = document.getElementById('swing-body');
+    const countEl = filterBar.querySelector('.filter-count');
 
-        if (hasSector) {
-          const groups = {};
-          table.rows.forEach(row => {
-            const sector = row['Sector'] || row['sector'] || 'Other';
-            if (!groups[sector]) groups[sector] = [];
-            groups[sector].push(row);
-          });
-
-          const otherHeaders = table.headers.filter(h => h.toLowerCase() !== 'sector');
-
-          for (const [sector, rows] of Object.entries(groups)) {
-            out += `<details class="market-strategy" open>
-              <summary><h3 style="display:inline;color:var(--accent);margin:0;">${sector}</h3>
-              <span class="count">${rows.length} signal${rows.length !== 1 ? 's' : ''}</span></summary>
-              <div class="table-wrapper">
-                <table>
-                  <thead><tr>${otherHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-                  <tbody>${rows.map(row => `<tr>${otherHeaders.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`).join('')}</tbody>
-                </table>
-              </div>
-            </details>`;
-          }
-        } else {
-          out += `<details class="market-strategy" open>
-            <summary><h3 style="display:inline;color:var(--accent);margin:0;">Results</h3>
-            <span class="count">${table.rows.length} row${table.rows.length !== 1 ? 's' : ''}</span></summary>
-            <div class="table-wrapper">
-              <table>
-                <thead><tr>${table.headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-                <tbody>${table.rows.map(row => `<tr>${table.headers.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`).join('')}</tbody>
-              </table>
-            </div>
-          </details>`;
+    function reRender() {
+      let totalShown = 0;
+      const htmlParts = [];
+      for (const mk of markets) {
+        const tbl = marketTables[mk.key];
+        if (!tbl) {
+          htmlParts.push(`<details class="market-strategy" open>
+            <summary><h3 style="display:inline;color:var(--accent);margin:0;">${mk.label}</h3>
+            <span class="count">0 setups</span></summary>
+            <div class="card" style="margin:0.5rem 1rem;"><p>No setups in this market today.</p></div>
+          </details>`);
+          continue;
         }
-      });
+        const filtered = applyFieldFilters(tbl.rows, fields, filterBar);
+        totalShown += filtered.length;
+        const inner = filtered.length === 0
+          ? `<div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);margin:0.5rem 1rem;">No setups match the current filters.</div>`
+          : renderSectorGroupedTable({ headers: tbl.headers, rows: filtered }, { countLabel: 'setup' + (filtered.length !== 1 ? 's' : '') });
+        htmlParts.push(`<details class="market-strategy" open>
+          <summary><h3 style="display:inline;color:var(--accent);margin:0;">${mk.label}</h3>
+          <span class="count">${filtered.length} / ${tbl.rows.length} setup${tbl.rows.length !== 1 ? 's' : ''}</span></summary>
+          ${inner}
+        </details>`);
+      }
+      countEl.textContent = `${totalShown} / ${allSwingRows.length} setups`;
+      bodyEl.innerHTML = htmlParts.join('');
     }
-
-    // Also render any non-table markdown content
-    const nonTableMd = md.replace(/\|[^\n]+\|(\n\|[^\n]+\|)*/g, '').trim();
-    if (nonTableMd) {
-      out += `<div class="card markdown-body" style="margin-top:1rem;">${marked.parse(nonTableMd)}</div>`;
-    }
-
-    renderSection(id, out);
+    wireFilterBar(filterBar, reRender);
+    reRender();
   }
 
   // ── Filterable Full Report ──────────────────────────
-
-  function _parseMktCap(str) {
-    if (!str) return null;
-    const s = str.trim();
-    const usMatch = s.match(/^\$?([\d.]+)\s*B$/i);
-    if (usMatch) return parseFloat(usMatch[1]) * 1e9;
-    const lakhCrMatch = s.match(/^([\d.]+)\s*L\s*Cr$/i);
-    if (lakhCrMatch) return parseFloat(lakhCrMatch[1]) * 1e5 * 1e7;
-    const crMatch = s.match(/^([\d,]+)\s*Cr$/i);
-    if (crMatch) return parseFloat(crMatch[1].replace(/,/g, '')) * 1e7;
-    return null;
-  }
-
-  function _parseAction(str) {
-    if (!str) return '';
-    // Use DOM parsing to safely extract visible text. A regex like
-    // /<span[^>]*>([^<]+)<\/span>/ breaks when the title attribute itself
-    // contains '>' (e.g. "Bullish DMA alignment (price>10>50>200)").
-    const tmp = document.createElement('div');
-    tmp.innerHTML = str;
-    return (tmp.textContent || '').trim().toUpperCase();
-  }
-
-  function _num(str) {
-    if (!str || str.trim() === '\u2014' || str.trim() === '—') return null;
-    const v = parseFloat(str);
-    return isNaN(v) ? null : v;
-  }
 
   function renderFilterableReport(id, title, md, market) {
     if (!md) {
@@ -686,20 +1127,22 @@
     for (const [sector, sectionMd] of Object.entries(sectorParts)) {
       const tables = extractTables(sectionMd);
       if (tables.length === 0) continue;
+      // Enrich the table with Price after Stock
+      const enriched = injectPrice(tables[0], market);
       allSectors.add(sector);
-      tables[0].rows.forEach(row => {
+      enriched.rows.forEach(row => {
         row._sector = sector;
-        row._score = _num(row['Score']) || 0;
-        row._mktCapRaw = _parseMktCap(row['Mkt Cap']);
-        row._action = _parseAction(row['Action']);
-        row._rsi = _num(row['RSI']);
-        row._adx = _num(row['ADX']);
-        row._macdPct = _num(row['MACD Hist%']);
-        row._volRatio = _num(row['Vol Ratio']);
-        row._pct52w = _num(row['52W High%']);
-        row._ret3m = _num(row['Ret 3M']);
-        row._ret1m = _num(row['Ret 1M']);
-        row._relStr3m = _num(row['Rel Str 3M']);
+        row._score = numOrNull(row['Score']) || 0;
+        row._mktCapRaw = parseMktCapBytes(row['Mkt Cap']);
+        row._action = parseActionText(row['Action']);
+        row._rsi = numOrNull(row['RSI']);
+        row._adx = numOrNull(row['ADX']);
+        row._macdPct = numOrNull(row['MACD Hist%']);
+        row._volRatio = numOrNull(row['Vol Ratio']);
+        row._pct52w = numOrNull(row['52W High%']);
+        row._ret3m = numOrNull(row['Ret 3M']);
+        row._ret1m = numOrNull(row['Ret 1M']);
+        row._relStr3m = numOrNull(row['Rel Str 3M']);
         allRows.push(row);
       });
     }
@@ -709,9 +1152,8 @@
       return;
     }
 
-    // All columns from the markdown table, used for rendering
     const headers = [
-      'Stock', 'Mkt Cap', 'Score', 'Horizon',
+      'Stock', 'Price', 'Mkt Cap', 'Score', 'Horizon',
       'RSI', 'ADX', 'MACD Hist%', 'Vol Ratio', '52W High%',
       'Ret 3M', 'Ret 1M', 'Rel Str 3M',
       'Strategies Triggered', 'Analyst Rating', 'Target (Upside)', 'Action',
@@ -721,8 +1163,6 @@
     const sectorOptions = Array.from(allSectors).sort().map(s =>
       `<option value="${s}">${s}</option>`).join('');
 
-    // Filter definitions: [label, data-attr, type, placeholder]
-    // type: 'select-action', 'select-sector', 'min', 'max', 'range-min', 'range-max'
     const filterId = `filter-${id}`;
     let out = `<h2 style="color:var(--text-heading);margin-bottom:1rem;">${title}</h2>`;
     out += `<div class="filter-bar" id="${filterId}">
@@ -743,6 +1183,10 @@
           <option value="">All</option>
           ${sectorOptions}
         </select>
+      </div>
+      <div class="filter-group">
+        <label>Stock contains</label>
+        <input type="text" data-filter="stock" placeholder="e.g. NVDA">
       </div>
       <div class="filter-group">
         <label>Mkt Cap &ge; (${capUnit})</label>
@@ -810,6 +1254,7 @@
     function applyFilters() {
       const actionVal = filterBar.querySelector('[data-filter="action"]').value;
       const sectorVal = filterBar.querySelector('[data-filter="sector"]').value;
+      const stockVal = (filterBar.querySelector('[data-filter="stock"]').value || '').toLowerCase();
       const mktCapMin = _fval('mktcap-min');
       const scoreMin = _fval('score-min');
       const rsiMax = _fval('rsi-max');
@@ -826,7 +1271,6 @@
         ? (market === 'india' ? mktCapMin * 1e7 : mktCapMin * 1e9)
         : null;
 
-      // Each numeric filter: if set, row must have a non-null value that satisfies it
       function _check(val, min, max) {
         if (min !== null && (val === null || val < min)) return false;
         if (max !== null && (val === null || val > max)) return false;
@@ -840,6 +1284,7 @@
           else if (row._action !== actionVal) return false;
         }
         if (sectorVal && row._sector !== sectorVal) return false;
+        if (stockVal && !(row['Stock'] || '').toLowerCase().includes(stockVal)) return false;
         if (mktCapMinRaw !== null && (row._mktCapRaw === null || row._mktCapRaw < mktCapMinRaw)) return false;
         if (scoreMin !== null && row._score < scoreMin) return false;
         if (!_check(row._rsi, rsiMin, rsiMax)) return false;
@@ -902,15 +1347,13 @@
 
   function formatCell(header, value) {
     const h = header.toLowerCase();
-    const v = value.trim();
+    const v = (value == null ? '' : String(value)).trim();
 
-    // Action / Signal columns → badges
     if (h === 'action' || h === 'signal' || h === 'recommendation' || h === 'status'
       || h === 'condition' || h === 'outcome') {
       return actionBadge(v);
     }
 
-    // Numeric change columns → color
     if ((h.includes('change') || h === 'return %') && v) {
       const num = parseFloat(v);
       if (!isNaN(num)) {
@@ -919,27 +1362,28 @@
       }
     }
 
-    // Color-code indicator columns
-    if (v === '\u2014' || v === '—') return `<span style="color:var(--text-muted);">—</span>`;
+    if (v === '\u2014' || v === '—' || v === '') return `<span style="color:var(--text-muted);">—</span>`;
+
+    // Price cell: keep the formatted currency as-is (no numeric color)
+    if (h === 'price' || h === 'current price' || h === 'entry' || h === 'entry price') {
+      return `<span style="color:var(--text-heading);font-family:var(--font-mono);">${v}</span>`;
+    }
+
     const num = parseFloat(v);
     if (isNaN(num)) return v;
 
-    // RSI: green if oversold (<30), red if overbought (>70)
     if (h === 'rsi') {
       const cls = num <= 30 ? 'positive' : num >= 70 ? 'negative' : '';
       return cls ? `<span class="index-change ${cls}">${v}</span>` : v;
     }
-    // ADX: bold if trending (>=25)
     if (h === 'adx') {
       return num >= 25 ? `<strong>${v}</strong>` : v;
     }
-    // Signed numeric columns: green/red by sign
     if (h === 'score' || h === 'macd hist%' || h === 'ret 3m' || h === 'ret 1m'
         || h === 'rel str 3m' || h === '52w high%') {
       const cls = num > 0 ? 'positive' : num < 0 ? 'negative' : '';
       return cls ? `<span class="index-change ${cls}">${v}</span>` : v;
     }
-    // Vol Ratio: highlight if >= 2
     if (h === 'vol ratio') {
       return num >= 2 ? `<strong class="index-change positive">${v}</strong>` : v;
     }
@@ -950,9 +1394,6 @@
   function actionBadge(text) {
     if (!text) return '';
 
-    // Unwrap an inline <span title="..."> coming from the markdown report
-    // (run_all.py emits these for action labels so the Full Report view also
-    // gets a native browser tooltip explaining the recommendation).
     let label = text;
     let titleAttr = '';
     const m = text.match(/<span\s+title="([^"]*)"\s*>([^<]+)<\/span>/i);
