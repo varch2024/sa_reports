@@ -123,6 +123,10 @@
     const topPicks = findPart(parts, 'Top Picks');
     renderTopPicks(topPicks);
 
+    // Multi-bagger Watch
+    const multibagger = findPart(parts, 'Multi-bagger Watch');
+    renderMultibagger(multibagger);
+
     // Sector Heatmap
     const heatmapUS = findPart(parts, 'Sector Heatmap');
     renderSectorHeatmap(heatmapUS);
@@ -277,6 +281,98 @@
     }
 
     renderSection('top-picks', out);
+  }
+
+  function renderMultibagger(md) {
+    if (!md) {
+      renderSection('multibagger', '<div class="card"><p>No multi-bagger data in this report.</p></div>');
+      return;
+    }
+
+    const subParts = splitByHeadings(md, 3);
+    let out = '<h2 style="color:var(--text-heading);margin-bottom:1rem;">Multi-bagger Watch</h2>';
+    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">Names that look early in their momentum phase. <strong>Multi-bagger Early</strong>: passes the strict gate (mid-cap + accelerating revenue & earnings + stage-2 trend + accumulation + relative strength + not-extended + quality grade ≠ F). <strong>Quad Green</strong>: 1D + 5D + 15D + 30D returns all positive AND OBV trending up. <strong>Streak 15D</strong>: 3 of 4 timeframes positive (lower-conviction flag).</p>';
+
+    const renderReturn = (val) => {
+      if (val === undefined || val === null || val === '') return '<span style="color:var(--text-muted);">—</span>';
+      const s = String(val).replace('%', '').trim();
+      const n = parseFloat(s);
+      if (isNaN(n)) return `<span>${val}</span>`;
+      const color = n > 0 ? 'var(--positive,#22c55e)' : n < 0 ? 'var(--negative,#ef4444)' : 'var(--text-muted)';
+      const sign = n > 0 ? '+' : '';
+      return `<span style="color:${color};font-weight:600;">${sign}${n.toFixed(2)}%</span>`;
+    };
+
+    const renderBadges = (badgeStr) => {
+      if (!badgeStr || badgeStr === '—') return '';
+      // Badges come in as backtick-wrapped tokens: `MULTIBAGGER` `QUAD GREEN` `VOL+` `ACCUM`
+      const tokens = (badgeStr.match(/`([^`]+)`/g) || []).map(t => t.replace(/`/g, ''));
+      return tokens.map(tok => {
+        const lower = tok.toLowerCase();
+        let cls = 'badge-buy';
+        if (lower.includes('multibagger')) cls = 'badge-strong-buy';
+        else if (lower.includes('quad')) cls = 'badge-buy';
+        else if (lower.includes('streak')) cls = 'badge-watch';
+        else if (lower.includes('vol')) cls = 'badge-buy';
+        else if (lower.includes('accum')) cls = 'badge-buy';
+        return `<span class="badge ${cls}" style="margin-right:0.25rem;">${tok}</span>`;
+      }).join('');
+    };
+
+    const renderBucket = (heading, tableMd) => {
+      const tables = extractTables(tableMd);
+      if (tables.length === 0 || tables[0].rows.length === 0) return '';
+      const empty = tables[0].rows.every(r => !r['Stock'] || /No qualifying names/.test(Object.values(r).join(' ')));
+      if (empty) {
+        return `<h3 style="color:var(--accent);margin:1.25rem 0 0.5rem;">${heading}</h3>
+                <div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);">No qualifying names today.</div>`;
+      }
+      let html = `<h3 style="color:var(--accent);margin:1.25rem 0 0.5rem;">${heading}</h3>`;
+      html += '<div class="card" style="padding:0;overflow-x:auto;"><table class="data-table" style="width:100%;border-collapse:collapse;">';
+      html += '<thead><tr>'
+        + ['Rank','Stock','Sector','Mkt Cap','Score','1D','5D','15D','30D','Badges','Action']
+          .map(h => `<th style="text-align:left;padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${h}</th>`).join('')
+        + '</tr></thead><tbody>';
+      tables[0].rows.forEach((row, i) => {
+        if (!row['Stock']) return;
+        html += '<tr>'
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${row['Rank'] || i + 1}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);font-weight:600;">${row['Stock']}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);color:var(--text-muted);">${row['Sector'] || ''}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);color:var(--text-muted);">${row['Mkt Cap'] || ''}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${row['Score'] || ''}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderReturn(row['1D'])}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderReturn(row['5D'])}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderReturn(row['15D'])}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderReturn(row['30D'])}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${renderBadges(row['Badges'] || '')}</td>`
+          + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${actionBadge(row['Action'] || '')}</td>`
+          + '</tr>';
+      });
+      html += '</tbody></table></div>';
+      return html;
+    };
+
+    // Render each bucket in order. Headings come from the markdown h3s.
+    const buckets = [
+      'US — Multi-bagger Early',
+      'US — Quad Green',
+      'US — Streak 15D',
+      'India — Multi-bagger Early',
+      'India — Quad Green',
+      'India — Streak 15D',
+    ];
+    for (const heading of buckets) {
+      const match = Object.keys(subParts).find(k =>
+        k.replace(/\s+/g, ' ').trim() === heading ||
+        k.replace(/—|-/g, '').replace(/\s+/g, ' ').trim() === heading.replace(/—|-/g, '').replace(/\s+/g, ' ').trim()
+      );
+      if (match) {
+        out += renderBucket(heading, subParts[match]);
+      }
+    }
+
+    renderSection('multibagger', out);
   }
 
   function renderSectorHeatmap(md) {
