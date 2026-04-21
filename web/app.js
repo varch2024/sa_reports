@@ -230,7 +230,10 @@
         const tables = extractTables(sectionMd);
         if (tables.length === 0 || tables[0].rows.length === 0) continue;
 
-        out += `<h3 style="color:var(--accent);margin:1.25rem 0 0.75rem;">${heading}</h3>`;
+        out += `<details class="market-strategy" open>
+          <summary><h3 style="display:inline;color:var(--accent);margin:0;">${heading}</h3>
+          <span class="count">${tables[0].rows.length} pick${tables[0].rows.length !== 1 ? 's' : ''}</span></summary>
+          <div style="padding:0.5rem 1rem;">`;
         tables[0].rows.forEach((row, i) => {
           const strategies = row['Strategies Triggered'] || row['strategies triggered'] || '';
           const badges = strategies.split(',').map(s => s.trim()).filter(Boolean)
@@ -254,6 +257,7 @@
               <div>${actionBadge(row['Action'] || '')}</div>
             </div>`;
         });
+        out += '</div></details>';
       }
     } else {
       // Fallback: single table without h3 sub-headings
@@ -320,15 +324,23 @@
     };
 
     const renderBucket = (heading, tableMd) => {
+      // Strip "US — " / "India — " prefix since the sub-tab already indicates market
+      const shortHeading = heading.replace(/^(US|India)\s*[—-]\s*/, '');
       const tables = extractTables(tableMd);
       if (tables.length === 0 || tables[0].rows.length === 0) return '';
       const empty = tables[0].rows.every(r => !r['Stock'] || /No qualifying names/.test(Object.values(r).join(' ')));
       if (empty) {
-        return `<h3 style="color:var(--accent);margin:1.25rem 0 0.5rem;">${heading}</h3>
-                <div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);">No qualifying names today.</div>`;
+        return `<details class="market-strategy" open>
+          <summary><h3 style="display:inline;color:var(--accent);margin:0;">${shortHeading}</h3>
+          <span class="count">0 names</span></summary>
+          <div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);margin:0.5rem 1rem;">No qualifying names today.</div>
+        </details>`;
       }
-      let html = `<h3 style="color:var(--accent);margin:1.25rem 0 0.5rem;">${heading}</h3>`;
-      html += '<div class="card" style="padding:0;overflow-x:auto;"><table class="data-table" style="width:100%;border-collapse:collapse;">';
+      const rowCount = tables[0].rows.filter(r => r['Stock']).length;
+      let html = `<details class="market-strategy" open>
+        <summary><h3 style="display:inline;color:var(--accent);margin:0;">${shortHeading}</h3>
+        <span class="count">${rowCount} name${rowCount !== 1 ? 's' : ''}</span></summary>`;
+      html += '<div class="card" style="padding:0;overflow-x:auto;margin:0.5rem 1rem;"><table class="data-table" style="width:100%;border-collapse:collapse;">';
       html += '<thead><tr>'
         + ['Rank','Stock','Sector','Mkt Cap','Score','1D','5D','15D','30D','Badges','Action']
           .map(h => `<th style="text-align:left;padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${h}</th>`).join('')
@@ -349,30 +361,52 @@
           + `<td style="padding:0.5rem 0.75rem;border-bottom:1px solid var(--border);">${actionBadge(row['Action'] || '')}</td>`
           + '</tr>';
       });
-      html += '</tbody></table></div>';
+      html += '</tbody></table></div></details>';
       return html;
     };
 
-    // Render each bucket in order. Headings come from the markdown h3s.
-    const buckets = [
-      'US — Multi-bagger Early',
-      'US — Quad Green',
-      'US — Streak 15D',
-      'India — Multi-bagger Early',
-      'India — Quad Green',
-      'India — Streak 15D',
-    ];
-    for (const heading of buckets) {
-      const match = Object.keys(subParts).find(k =>
-        k.replace(/\s+/g, ' ').trim() === heading ||
-        k.replace(/—|-/g, '').replace(/\s+/g, ' ').trim() === heading.replace(/—|-/g, '').replace(/\s+/g, ' ').trim()
-      );
-      if (match) {
-        out += renderBucket(heading, subParts[match]);
+    // Split buckets by market so we can render them under separate sub-tabs.
+    const marketBuckets = {
+      US: ['US — Multi-bagger Early', 'US — Quad Green', 'US — Streak 15D'],
+      India: ['India — Multi-bagger Early', 'India — Quad Green', 'India — Streak 15D'],
+    };
+    const matchHeading = (heading) => Object.keys(subParts).find(k =>
+      k.replace(/\s+/g, ' ').trim() === heading ||
+      k.replace(/—|-/g, '').replace(/\s+/g, ' ').trim() === heading.replace(/—|-/g, '').replace(/\s+/g, ' ').trim()
+    );
+    const renderMarket = (market) => {
+      let html = '';
+      for (const heading of marketBuckets[market]) {
+        const match = matchHeading(heading);
+        if (match) html += renderBucket(heading, subParts[match]);
       }
-    }
+      return html || '<div class="card" style="padding:0.75rem 1rem;color:var(--text-muted);">No data for this market.</div>';
+    };
+
+    out += `
+      <div class="mb-subtabs" style="display:flex;gap:0.25rem;margin-bottom:1rem;">
+        <button class="tab active" data-mb-market="US">US</button>
+        <button class="tab" data-mb-market="India">India</button>
+      </div>
+      <div class="mb-panel" data-mb-panel="US">${renderMarket('US')}</div>
+      <div class="mb-panel" data-mb-panel="India" style="display:none;">${renderMarket('India')}</div>
+    `;
 
     renderSection('multibagger', out);
+
+    // Wire up sub-tab toggle
+    const root = document.getElementById('section-multibagger');
+    if (root) {
+      root.querySelectorAll('[data-mb-market]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const market = btn.getAttribute('data-mb-market');
+          root.querySelectorAll('[data-mb-market]').forEach(b =>
+            b.classList.toggle('active', b.getAttribute('data-mb-market') === market));
+          root.querySelectorAll('[data-mb-panel]').forEach(p =>
+            p.style.display = p.getAttribute('data-mb-panel') === market ? '' : 'none');
+        });
+      });
+    }
   }
 
   function renderSectorHeatmap(md) {
@@ -525,13 +559,21 @@
     }
 
     for (const [heading, mdBlock] of [['US Swing Trades', usMd], ['India Swing Trades', indiaMd]]) {
-      out += `<h3 style="color:var(--accent);margin:1.25rem 0 0.75rem;">${heading}</h3>`;
       const tables = extractTables(mdBlock);
       if (tables.length === 0 || tables[0].rows.length === 0) {
-        out += '<div class="card"><p>No setups in this market today.</p></div>';
+        out += `<details class="market-strategy" open>
+          <summary><h3 style="display:inline;color:var(--accent);margin:0;">${heading}</h3>
+          <span class="count">0 setups</span></summary>
+          <div class="card" style="margin:0.5rem 1rem;"><p>No setups in this market today.</p></div>
+        </details>`;
         continue;
       }
+      const setupCount = tables.reduce((n, t) => n + t.rows.length, 0);
+      out += `<details class="market-strategy" open>
+        <summary><h3 style="display:inline;color:var(--accent);margin:0;">${heading}</h3>
+        <span class="count">${setupCount} setup${setupCount !== 1 ? 's' : ''}</span></summary>`;
       out += renderStrategyTablesHtml(tables);
+      out += '</details>';
     }
 
     if (methodology) {
@@ -566,28 +608,28 @@
           const otherHeaders = table.headers.filter(h => h.toLowerCase() !== 'sector');
 
           for (const [sector, rows] of Object.entries(groups)) {
-            out += `
-              <div class="sector-group">
-                <div class="sector-group-header">
-                  <h3>${sector}</h3>
-                  <span class="count">${rows.length} signal${rows.length !== 1 ? 's' : ''}</span>
-                </div>
-                <div class="table-wrapper">
-                  <table>
-                    <thead><tr>${otherHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-                    <tbody>${rows.map(row => `<tr>${otherHeaders.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`).join('')}</tbody>
-                  </table>
-                </div>
-              </div>`;
+            out += `<details class="market-strategy" open>
+              <summary><h3 style="display:inline;color:var(--accent);margin:0;">${sector}</h3>
+              <span class="count">${rows.length} signal${rows.length !== 1 ? 's' : ''}</span></summary>
+              <div class="table-wrapper">
+                <table>
+                  <thead><tr>${otherHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+                  <tbody>${rows.map(row => `<tr>${otherHeaders.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`).join('')}</tbody>
+                </table>
+              </div>
+            </details>`;
           }
         } else {
-          out += `
+          out += `<details class="market-strategy" open>
+            <summary><h3 style="display:inline;color:var(--accent);margin:0;">Results</h3>
+            <span class="count">${table.rows.length} row${table.rows.length !== 1 ? 's' : ''}</span></summary>
             <div class="table-wrapper">
               <table>
                 <thead><tr>${table.headers.map(h => `<th>${h}</th>`).join('')}</tr></thead>
                 <tbody>${table.rows.map(row => `<tr>${table.headers.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`).join('')}</tbody>
               </table>
-            </div>`;
+            </div>
+          </details>`;
         }
       });
     }
@@ -822,18 +864,18 @@
       const displayHeaders = headers.filter(h => h !== 'Sector');
       for (const [sector, rows] of Object.entries(groups)) {
         html += `
-          <div class="sector-group">
-            <div class="sector-group-header">
-              <h4 style="margin:0;">${sector}</h4>
-              <span class="count">${rows.length}</span>
+          <details class="market-strategy" open>
+            <summary><h3 style="display:inline;color:var(--accent);margin:0;">${sector}</h3>
+            <span class="count">${rows.length} stock${rows.length !== 1 ? 's' : ''}</span></summary>
+            <div class="table-wrapper">
+              <table>
+                <thead><tr>${displayHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead>
+                <tbody>${rows.map(row =>
+                  `<tr>${displayHeaders.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`
+                ).join('')}</tbody>
+              </table>
             </div>
-            <table>
-              <thead><tr>${displayHeaders.map(h => `<th>${h}</th>`).join('')}</tr></thead>
-              <tbody>${rows.map(row =>
-                `<tr>${displayHeaders.map(h => `<td>${formatCell(h, row[h] || '')}</td>`).join('')}</tr>`
-              ).join('')}</tbody>
-            </table>
-          </div>`;
+          </details>`;
       }
 
       if (filtered.length === 0) {
