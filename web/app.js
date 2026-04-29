@@ -146,6 +146,9 @@
     const multibagger = findPart(parts, 'Multi-bagger Watch');
     renderMultibagger(multibagger);
 
+    const indexWatch = findPart(parts, 'Index Watch');
+    renderIndexWatch(indexWatch);
+
     const heatmapUS = findPart(parts, 'Sector Heatmap');
     renderSectorHeatmap(heatmapUS);
 
@@ -878,6 +881,184 @@
           p.style.display = p.getAttribute('data-mb-panel') === market ? '' : 'none');
       });
     });
+  }
+
+  // ── Index Watch (SOX / SMH / GS_AIDC / AI_WATCH) ───
+
+  function indexBadge(code) {
+    const c = String(code).trim();
+    let cls = 'badge-neutral';
+    if (c === 'SOX') cls = 'badge-buy';
+    else if (c === 'SMH') cls = 'badge-strong-buy';
+    else if (c === 'GS_AIDC') cls = 'badge-watch';
+    else if (c === 'AI_WATCH') cls = 'badge-warm';
+    return `<span class="badge ${cls}" style="margin-right:0.25rem;font-size:0.7rem;padding:0.1rem 0.35rem;">${c}</span>`;
+  }
+
+  function renderIndexWatch(md) {
+    if (!md) {
+      renderSection('index-watch',
+        '<div class="card"><h2>Index Watch</h2><p>No Index Watch section in this report.</p></div>');
+      return;
+    }
+
+    const subSectorParts = splitByHeadings(md, 3);
+    const allRows = [];
+
+    for (const [subSector, sectionMd] of Object.entries(subSectorParts)) {
+      const tables = extractTables(sectionMd);
+      if (tables.length === 0 || tables[0].rows.length === 0) continue;
+      const enriched = injectPrice(tables[0], 'us');
+      enriched.rows.forEach(row => {
+        row['Sub-sector'] = subSector;
+        row['_subSector'] = subSector;
+        row['_indexes'] = (row['Indexes'] || '').split('/').map(x => x.trim()).filter(Boolean);
+        allRows.push(row);
+      });
+    }
+    annotateRows(allRows, { defaultMarket: 'us' });
+
+    if (allRows.length === 0) {
+      renderSection('index-watch',
+        '<div class="card"><h2>Index Watch</h2><p>No index members matched scan data today.</p></div>');
+      return;
+    }
+
+    // Collect index codes for the filter
+    const indexSet = new Set();
+    allRows.forEach(r => r['_indexes'].forEach(i => indexSet.add(i)));
+    const indexCodes = Array.from(indexSet).sort();
+
+    const filterId = 'filter-index-watch';
+
+    // Build a custom filter bar (we have non-standard select-index/select-subsector)
+    const subSectorOptions = Array.from(new Set(allRows.map(r => r._subSector))).sort()
+      .map(s => `<option value="${s}">${s}</option>`).join('');
+    const indexOptions = indexCodes.map(c => `<option value="${c}">${c}</option>`).join('');
+
+    let out = '<h2 style="color:var(--text-heading);margin-bottom:1rem;">Index Watch</h2>';
+    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">US members of the major AI / semiconductor indexes & baskets, grouped by sub-sector. ';
+    out += '<strong>SOX</strong> = PHLX Semiconductor Sector Index · ';
+    out += '<strong>SMH</strong> = VanEck Semiconductor ETF · ';
+    out += '<strong>GS_AIDC</strong> = Goldman Sachs AI Data Centers basket · ';
+    out += '<strong>AI_WATCH</strong> = curated AI / data-center watch basket. ';
+    out += 'Edit membership in <code>config/index_baskets.json</code>.</p>';
+
+    out += `<div class="filter-bar" id="${filterId}">
+      <div class="filter-group">
+        <label>Action</label>
+        <select data-filter-idx="0">
+          <option value="">All</option>
+          <option value="STRONG BUY">STRONG BUY</option>
+          <option value="BUY">BUY</option>
+          <option value="WATCH">WATCH</option>
+          <option value="SELL">SELL</option>
+          <option value="STRONG SELL">STRONG SELL</option>
+        </select>
+      </div>
+      <div class="filter-group">
+        <label>Index</label>
+        <select data-filter-idx="1"><option value="">All</option>${indexOptions}</select>
+      </div>
+      <div class="filter-group">
+        <label>Sub-sector</label>
+        <select data-filter-idx="2"><option value="">All</option>${subSectorOptions}</select>
+      </div>
+      <div class="filter-group">
+        <label>Score ≥</label>
+        <input type="number" data-filter-idx="3" placeholder="e.g. 5" step="any">
+      </div>
+      <div class="filter-group">
+        <label>Stock contains</label>
+        <input type="text" data-filter-idx="4" placeholder="e.g. NVDA">
+      </div>
+      <div class="filter-group filter-actions">
+        <button class="filter-reset">Reset</button>
+        <span class="filter-count">${allRows.length} stocks</span>
+      </div>
+    </div>`;
+    out += `<div id="index-watch-body"></div>`;
+    renderSection('index-watch', out);
+
+    const filterBar = document.getElementById(filterId);
+    const bodyEl = document.getElementById('index-watch-body');
+    const countEl = filterBar.querySelector('.filter-count');
+
+    function applyFilters() {
+      const actionVal = filterBar.querySelector('[data-filter-idx="0"]').value;
+      const indexVal = filterBar.querySelector('[data-filter-idx="1"]').value;
+      const subVal = filterBar.querySelector('[data-filter-idx="2"]').value;
+      const scoreMinRaw = filterBar.querySelector('[data-filter-idx="3"]').value;
+      const scoreMin = scoreMinRaw ? parseFloat(scoreMinRaw) : null;
+      const stockVal = (filterBar.querySelector('[data-filter-idx="4"]').value || '').toLowerCase();
+
+      return allRows.filter(row => {
+        if (actionVal) {
+          const action = row._action;
+          if (actionVal === 'BUY' && action === 'STRONG BUY') {/* ok */}
+          else if (actionVal === 'SELL' && action === 'STRONG SELL') {/* ok */}
+          else if (action !== actionVal) return false;
+        }
+        if (indexVal && !row._indexes.includes(indexVal)) return false;
+        if (subVal && row._subSector !== subVal) return false;
+        if (scoreMin !== null) {
+          const s = numOrNull(row['Score']);
+          if (s == null || s < scoreMin) return false;
+        }
+        if (stockVal && !(row['Stock'] || '').toLowerCase().includes(stockVal)) return false;
+        return true;
+      });
+    }
+
+    function reRender() {
+      const filtered = applyFilters();
+      countEl.textContent = `${filtered.length} / ${allRows.length} stocks`;
+      if (filtered.length === 0) {
+        bodyEl.innerHTML = '<div class="card"><p>No stocks match the current filters.</p></div>';
+        return;
+      }
+      const bySub = {};
+      filtered.forEach(r => {
+        const s = r._subSector || 'Other';
+        (bySub[s] = bySub[s] || []).push(r);
+      });
+      const subList = Object.keys(bySub).sort();
+      // Display headers: keep all but Sub-sector and Indexes (Indexes will be rendered as badges)
+      const baseHeaders = ['Stock', 'Price', 'Indexes', 'Mkt Cap', 'Score', 'Horizon',
+        'RSI', 'ADX', 'MACD Hist%', 'Vol Ratio', '52W High%', 'Ret 3M', 'Strategies', 'Action'];
+      bodyEl.innerHTML = subList.map(sub => {
+        const rows = bySub[sub];
+        const tableInner = `<div class="table-wrapper"><table><thead><tr>${
+          baseHeaders.map(h => `<th>${h}</th>`).join('')
+        }</tr></thead><tbody>${
+          rows.map(row => '<tr>' + baseHeaders.map(h => {
+            if (h === 'Indexes') {
+              const badges = (row._indexes || []).map(indexBadge).join('');
+              return `<td>${badges}</td>`;
+            }
+            return `<td>${formatCell(h, row[h] || '')}</td>`;
+          }).join('') + '</tr>').join('')
+        }</tbody></table></div>`;
+        return `<details class="market-strategy" open>
+          <summary>
+            <h3 style="display:inline;color:var(--accent);margin:0;">${sub}</h3>
+            <span class="count">${rows.length} stock${rows.length !== 1 ? 's' : ''}</span>
+          </summary>
+          ${tableInner}
+        </details>`;
+      }).join('');
+    }
+
+    filterBar.querySelectorAll('select, input').forEach(el => {
+      el.addEventListener('change', reRender);
+      el.addEventListener('input', reRender);
+    });
+    filterBar.querySelector('.filter-reset').addEventListener('click', () => {
+      filterBar.querySelectorAll('select').forEach(s => s.value = '');
+      filterBar.querySelectorAll('input').forEach(i => i.value = '');
+      reRender();
+    });
+    reRender();
   }
 
   // ── Sector Heatmap ──────────────────────────────────
