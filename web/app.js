@@ -146,6 +146,8 @@
     const multibagger = findPart(parts, 'Multi-bagger Watch');
     renderMultibagger(multibagger);
 
+    renderRecentIpos();
+
     const indexWatch = findPart(parts, 'Index Watch');
     renderIndexWatch(indexWatch);
 
@@ -881,6 +883,195 @@
           p.style.display = p.getAttribute('data-mb-panel') === market ? '' : 'none');
       });
     });
+  }
+
+  // ── Recent IPOs (10 ≤ data_days < 50) ──────────────
+  //
+  // Reads `scanData.recent_ipos.{us,india}` directly rather than parsing
+  // markdown — the partial-data records are already structured in the cache,
+  // and the markdown table is just a serialization of the same fields.
+
+  function renderRecentIpos() {
+    const root = document.getElementById('section-recent-ipos');
+    if (!root) return;
+
+    const ipos = (scanData && scanData.recent_ipos) || {};
+    const us = ipos.us || {};
+    const india = ipos.india || {};
+    const usCount = Object.keys(us).length;
+    const inCount = Object.keys(india).length;
+
+    let out = '<h2 style="color:var(--text-heading);margin-bottom:1rem;">Recent IPOs</h2>';
+    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">';
+    out += 'Stocks with 10–49 trading days of history — too young for the full ';
+    out += 'composite score (no SMA50/200, no MACD, no 3-month return), so they are ';
+    out += 'excluded from Top Picks and Unified Recommendations. ';
+    out += 'Below is whatever <em>can</em> be computed from the available bars; ';
+    out += 'treat as observational. Revisit once they accumulate ≥50 bars.';
+    out += '</p>';
+
+    if (usCount === 0 && inCount === 0) {
+      out += '<div class="card"><p>No recent IPOs in the current scan data.</p></div>';
+      renderSection('recent-ipos', out);
+      return;
+    }
+
+    out += `
+      <div class="mb-subtabs" style="display:flex;gap:0.25rem;margin-bottom:1rem;">
+        <button class="tab active" data-ipo-market="US">US (${usCount})</button>
+        <button class="tab" data-ipo-market="India">India (${inCount})</button>
+      </div>
+      <div class="ipo-panel" data-ipo-panel="US"></div>
+      <div class="ipo-panel" data-ipo-panel="India" style="display:none;"></div>
+    `;
+    renderSection('recent-ipos', out);
+
+    renderIpoMarketPanel('US', us);
+    renderIpoMarketPanel('India', india);
+
+    root.querySelectorAll('[data-ipo-market]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const market = btn.getAttribute('data-ipo-market');
+        root.querySelectorAll('[data-ipo-market]').forEach(b =>
+          b.classList.toggle('active', b.getAttribute('data-ipo-market') === market));
+        root.querySelectorAll('[data-ipo-panel]').forEach(p =>
+          p.style.display = p.getAttribute('data-ipo-panel') === market ? '' : 'none');
+      });
+    });
+  }
+
+  function renderIpoMarketPanel(marketKey, ipoMap) {
+    const root = document.getElementById('section-recent-ipos');
+    if (!root) return;
+    const panel = root.querySelector(`[data-ipo-panel="${marketKey}"]`);
+    if (!panel) return;
+
+    const rows = Object.entries(ipoMap).map(([sym, d]) => ({
+      Stock: sym,
+      Sector: d.sector || 'Other',
+      Days: d.data_days != null ? d.data_days : '',
+      'First Bar': d.first_seen_date || '',
+      Price: d.close,
+      '1D %': d.change_pct,
+      'Vol Ratio': d.vol_ratio,
+      RSI: d.RSI,
+      '5D %': d.return_5d,
+      '15D %': d.return_15d,
+      '1M %': d.return_1m,
+      '% from High': d.pct_from_high,
+      _raw: d,
+    }));
+    rows.sort((a, b) => (a.Days || 0) - (b.Days || 0) || a.Stock.localeCompare(b.Stock));
+
+    if (rows.length === 0) {
+      panel.innerHTML = `<div class="card"><p>No recent IPOs for ${marketKey}.</p></div>`;
+      return;
+    }
+
+    const fields = [
+      { key: 'Sector', label: 'Sector', type: 'select-sector' },
+      { key: 'Days', label: 'Min Days', type: 'num-min', placeholder: 'e.g. 20' },
+      { key: 'Stock', label: 'Stock contains', type: 'text-contains', placeholder: 'e.g. ACME' },
+    ];
+    const filterId = `filter-ipo-${marketKey.toLowerCase()}`;
+    const bodyId = `ipo-body-${marketKey.toLowerCase()}`;
+    panel.innerHTML = buildFilterBar(fields, rows, { id: filterId, countLabel: 'IPOs' }) +
+                      `<div id="${bodyId}"></div>`;
+
+    const filterBar = document.getElementById(filterId);
+    const bodyEl = document.getElementById(bodyId);
+    const countEl = filterBar.querySelector('.filter-count');
+
+    const fmtPct = (v) => {
+      if (v == null || v === '') return '<span style="color:var(--text-muted);">—</span>';
+      const n = Number(v);
+      if (isNaN(n)) return String(v);
+      const color = n > 0 ? 'var(--positive,#22c55e)' : n < 0 ? 'var(--negative,#ef4444)' : 'var(--text-muted)';
+      const sign = n > 0 ? '+' : '';
+      return `<span style="color:${color};font-weight:600;">${sign}${n.toFixed(2)}%</span>`;
+    };
+    const fmtNum = (v, digits = 2) => {
+      if (v == null || v === '') return '<span style="color:var(--text-muted);">—</span>';
+      const n = Number(v);
+      if (isNaN(n)) return String(v);
+      return n.toFixed(digits);
+    };
+    const fmtPrice = (v, market) => {
+      if (v == null || v === '') return '<span style="color:var(--text-muted);">—</span>';
+      const n = Number(v);
+      if (isNaN(n)) return String(v);
+      return market === 'India'
+        ? `₹${n.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`
+        : `$${n.toLocaleString('en-US', { maximumFractionDigits: 2 })}`;
+    };
+
+    const headerCells = ['Stock', 'Price', 'Sector', 'Days', 'First Bar',
+                         '1D %', 'Vol Ratio', 'RSI', '5D %', '15D %', '1M %', '% from High'];
+
+    function reRender() {
+      const filtered = rows.filter(row => {
+        for (let i = 0; i < fields.length; i++) {
+          const f = fields[i];
+          const el = filterBar.querySelector(`[data-filter-idx="${i}"]`);
+          if (!el || !el.value) continue;
+          if (f.type === 'select-sector') {
+            if ((row.Sector || '') !== el.value) return false;
+          } else if (f.type === 'text-contains') {
+            if (!(row.Stock || '').toLowerCase().includes(el.value.toLowerCase())) return false;
+          } else if (f.type === 'num-min') {
+            const rv = Number(row[f.key]);
+            const t = parseFloat(el.value);
+            if (isNaN(rv) || rv < t) return false;
+          }
+        }
+        return true;
+      });
+      countEl.textContent = `${filtered.length} / ${rows.length} IPOs`;
+
+      if (filtered.length === 0) {
+        bodyEl.innerHTML = '<div class="card"><p>No IPOs match the current filters.</p></div>';
+        return;
+      }
+
+      const bySector = {};
+      filtered.forEach(r => {
+        const s = r.Sector || 'Other';
+        (bySector[s] = bySector[s] || []).push(r);
+      });
+      const sectorList = Object.keys(bySector).sort();
+      bodyEl.innerHTML = sectorList.map(sector => {
+        const sRows = bySector[sector];
+        const inner = `<div class="table-wrapper"><table><thead><tr>${
+          headerCells.map(h => `<th>${h}</th>`).join('')
+        }</tr></thead><tbody>` +
+          sRows.map(row => {
+            return '<tr>' +
+              `<td style="font-weight:600;">${row.Stock}</td>` +
+              `<td style="color:var(--text-heading);">${fmtPrice(row.Price, marketKey)}</td>` +
+              `<td style="color:var(--text-muted);">${row.Sector || ''}</td>` +
+              `<td>${row.Days}</td>` +
+              `<td style="color:var(--text-muted);font-size:0.85rem;">${row['First Bar'] || ''}</td>` +
+              `<td>${fmtPct(row['1D %'])}</td>` +
+              `<td>${fmtNum(row['Vol Ratio'], 1)}x</td>` +
+              `<td>${fmtNum(row.RSI, 1)}</td>` +
+              `<td>${fmtPct(row['5D %'])}</td>` +
+              `<td>${fmtPct(row['15D %'])}</td>` +
+              `<td>${fmtPct(row['1M %'])}</td>` +
+              `<td>${fmtPct(row['% from High'])}</td>` +
+              '</tr>';
+          }).join('') + '</tbody></table></div>';
+        return `<details class="sector-details" open>
+          <summary>
+            <h4 style="display:inline;color:var(--accent);margin:0;font-size:0.95rem;">${sector}</h4>
+            <span class="count">${sRows.length} name${sRows.length !== 1 ? 's' : ''}</span>
+          </summary>
+          ${inner}
+        </details>`;
+      }).join('');
+    }
+
+    wireFilterBar(filterBar, reRender);
+    reRender();
   }
 
   // ── Index Watch (SOX / SMH / GS_AIDC / AI_WATCH) ───
