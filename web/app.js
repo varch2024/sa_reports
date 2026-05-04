@@ -1094,9 +1094,13 @@
     }
 
     const subSectorParts = splitByHeadings(md, 3);
-    const allRows = [];
+    // Pull the Deep Analysis subsection aside — it gets its own sub-tab.
+    const deepAnalysisMd = subSectorParts['Deep Analysis'] || '';
+    const subSectorEntries = Object.entries(subSectorParts)
+      .filter(([k]) => k !== 'Deep Analysis');
 
-    for (const [subSector, sectionMd] of Object.entries(subSectorParts)) {
+    const allRows = [];
+    for (const [subSector, sectionMd] of subSectorEntries) {
       const tables = extractTables(sectionMd);
       if (tables.length === 0 || tables[0].rows.length === 0) continue;
       const enriched = injectPrice(tables[0], 'us');
@@ -1109,7 +1113,7 @@
     }
     annotateRows(allRows, { defaultMarket: 'us' });
 
-    if (allRows.length === 0) {
+    if (allRows.length === 0 && !deepAnalysisMd) {
       renderSection('index-watch',
         '<div class="card"><h2>Index Watch</h2><p>No index members matched scan data today.</p></div>');
       return;
@@ -1128,13 +1132,21 @@
     const indexOptions = indexCodes.map(c => `<option value="${c}">${c}</option>`).join('');
 
     let out = '<h2 style="color:var(--text-heading);margin-bottom:1rem;">Index Watch</h2>';
-    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">US members of the major AI / semiconductor indexes & baskets, grouped by sub-sector. ';
+    out += '<p style="color:var(--text-muted);margin-bottom:1rem;">US members of the major AI / semiconductor indexes & baskets. ';
     out += '<strong>SOX</strong> = PHLX Semiconductor Sector Index · ';
     out += '<strong>SMH</strong> = VanEck Semiconductor ETF · ';
     out += '<strong>GS_AIDC</strong> = Goldman Sachs AI Data Centers basket · ';
     out += '<strong>AI_WATCH</strong> = curated AI / data-center watch basket. ';
     out += 'Edit membership in <code>config/index_baskets.json</code>.</p>';
 
+    out += `
+      <div class="iw-subtabs" style="display:flex;gap:0.25rem;margin-bottom:1rem;">
+        <button class="tab active" data-iw-tab="bysector">By Sub-sector</button>
+        <button class="tab" data-iw-tab="deep">Deep Analysis</button>
+      </div>
+    `;
+
+    out += `<div class="iw-panel" data-iw-panel="bysector">`;
     out += `<div class="filter-bar" id="${filterId}">
       <div class="filter-group">
         <label>Action</label>
@@ -1169,7 +1181,28 @@
       </div>
     </div>`;
     out += `<div id="index-watch-body"></div>`;
+    out += `</div>`;
+
+    out += `<div class="iw-panel" data-iw-panel="deep" style="display:none;">
+      <div id="index-watch-deep-body"></div>
+    </div>`;
+
     renderSection('index-watch', out);
+
+    // Wire sub-tab switching
+    const rootSec = document.getElementById('section-index-watch');
+    rootSec.querySelectorAll('[data-iw-tab]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const which = btn.getAttribute('data-iw-tab');
+        rootSec.querySelectorAll('[data-iw-tab]').forEach(b =>
+          b.classList.toggle('active', b.getAttribute('data-iw-tab') === which));
+        rootSec.querySelectorAll('[data-iw-panel]').forEach(p =>
+          p.style.display = p.getAttribute('data-iw-panel') === which ? '' : 'none');
+      });
+    });
+
+    // Render deep-analysis panel (parses its own table + JSON blob)
+    renderIndexWatchDeep(deepAnalysisMd);
 
     const filterBar = document.getElementById(filterId);
     const bodyEl = document.getElementById('index-watch-body');
@@ -1238,6 +1271,226 @@
           ${tableInner}
         </details>`;
       }).join('');
+    }
+
+    filterBar.querySelectorAll('select, input').forEach(el => {
+      el.addEventListener('change', reRender);
+      el.addEventListener('input', reRender);
+    });
+    filterBar.querySelector('.filter-reset').addEventListener('click', () => {
+      filterBar.querySelectorAll('select').forEach(s => s.value = '');
+      filterBar.querySelectorAll('input').forEach(i => i.value = '');
+      reRender();
+    });
+    reRender();
+  }
+
+  // ── Index Watch — Deep Analysis sub-tab ─────────────
+  //
+  // Reads two things from the markdown:
+  //   1. The summary table (one row per stock, with pillar % cells)
+  //   2. An HTML comment <!--INDEX_DEEP_DATA{...}--> carrying the full
+  //      per-pillar checklist for each stock (rendered when a row is expanded)
+
+  function statusIcon(status) {
+    if (status === 'pass') return '<span style="color:var(--positive,#22c55e);">✓</span>';
+    if (status === 'warn') return '<span style="color:#f59e0b;">!</span>';
+    if (status === 'fail') return '<span style="color:var(--negative,#ef4444);">✗</span>';
+    return '<span style="color:var(--text-muted);">—</span>';
+  }
+
+  function pillarBadge(pctText) {
+    if (!pctText || pctText === '—') return `<span style="color:var(--text-muted);">—</span>`;
+    const m = pctText.match(/^(\d+(?:\.\d+)?)%/);
+    if (!m) return pctText;
+    const n = parseFloat(m[1]);
+    let cls = 'badge-watch';
+    if (n >= 75) cls = 'badge-strong-buy';
+    else if (n >= 60) cls = 'badge-buy';
+    else if (n >= 40) cls = 'badge-watch';
+    else cls = 'badge-sell';
+    return `<span class="badge ${cls}" style="font-size:0.75rem;padding:0.15rem 0.4rem;">${pctText}</span>`;
+  }
+
+  function gradeBadge(g) {
+    const grade = String(g || '—').trim();
+    if (grade === '—') return '<span style="color:var(--text-muted);">—</span>';
+    let cls = 'badge-watch';
+    if (grade === 'A') cls = 'badge-strong-buy';
+    else if (grade === 'B') cls = 'badge-buy';
+    else if (grade === 'C') cls = 'badge-watch';
+    else if (grade === 'D' || grade === 'F') cls = 'badge-sell';
+    return `<span class="badge ${cls}" style="font-size:0.8rem;font-weight:700;padding:0.15rem 0.45rem;">${grade}</span>`;
+  }
+
+  function renderIndexWatchDeep(md) {
+    const bodyEl = document.getElementById('index-watch-deep-body');
+    if (!bodyEl) return;
+    if (!md) {
+      bodyEl.innerHTML = '<div class="card"><p>No deep-analysis data in this report.</p></div>';
+      return;
+    }
+
+    const tables = extractTables(md);
+    if (tables.length === 0 || tables[0].rows.length === 0) {
+      bodyEl.innerHTML = '<div class="card"><p>No deep-analysis rows.</p></div>';
+      return;
+    }
+    const enriched = injectPrice(tables[0], 'us');
+    const rows = enriched.rows.map(r => ({
+      ...r,
+      _subSector: r['Sub-sector'] || 'Other',
+      _indexes: (r['Indexes'] || '').split('/').map(x => x.trim()).filter(Boolean),
+      _overall: (() => {
+        const m = String(r['Overall'] || '').match(/(\d+(?:\.\d+)?)/);
+        return m ? parseFloat(m[1]) : null;
+      })(),
+    }));
+
+    // Parse the embedded JSON blob with full per-pillar checklists
+    let deepData = {};
+    const m = md.match(/<!--INDEX_DEEP_DATA\s*([\s\S]+?)-->/);
+    if (m) {
+      try { deepData = JSON.parse(m[1].trim()); } catch (e) { deepData = {}; }
+    }
+
+    const subSectorOptions = Array.from(new Set(rows.map(r => r._subSector))).sort()
+      .map(s => `<option value="${s}">${s}</option>`).join('');
+    const indexSet = new Set();
+    rows.forEach(r => r._indexes.forEach(i => indexSet.add(i)));
+    const indexOptions = Array.from(indexSet).sort()
+      .map(s => `<option value="${s}">${s}</option>`).join('');
+
+    const filterId = 'filter-iw-deep';
+    bodyEl.innerHTML = `
+      <p style="color:var(--text-muted);margin-bottom:1rem;">
+        Each member scored against the four-pillar checklist in <code>config/prompt.txt</code>:
+        Fundamental + Valuation, Technical, Sentiment. Pillar scores are pass-weighted percentages
+        of evaluable checks (pass=1.0, warn=0.5, fail=0); Overall is a 30/35/35 weighted blend.
+        Click a row to expand its per-check breakdown.
+      </p>
+      <div class="filter-bar" id="${filterId}">
+        <div class="filter-group">
+          <label>Index</label>
+          <select data-filter-idx="0"><option value="">All</option>${indexOptions}</select>
+        </div>
+        <div class="filter-group">
+          <label>Sub-sector</label>
+          <select data-filter-idx="1"><option value="">All</option>${subSectorOptions}</select>
+        </div>
+        <div class="filter-group">
+          <label>Grade</label>
+          <select data-filter-idx="2">
+            <option value="">All</option>
+            <option value="A">A</option><option value="B">B</option>
+            <option value="C">C</option><option value="D">D</option>
+            <option value="F">F</option>
+          </select>
+        </div>
+        <div class="filter-group">
+          <label>Overall ≥</label>
+          <input type="number" data-filter-idx="3" placeholder="e.g. 70" step="any">
+        </div>
+        <div class="filter-group">
+          <label>Stock contains</label>
+          <input type="text" data-filter-idx="4" placeholder="e.g. NVDA">
+        </div>
+        <div class="filter-group filter-actions">
+          <button class="filter-reset">Reset</button>
+          <span class="filter-count">${rows.length} stocks</span>
+        </div>
+      </div>
+      <div id="iw-deep-table"></div>
+    `;
+
+    const filterBar = document.getElementById(filterId);
+    const countEl = filterBar.querySelector('.filter-count');
+    const tableEl = document.getElementById('iw-deep-table');
+
+    function applyFilters() {
+      const indexVal = filterBar.querySelector('[data-filter-idx="0"]').value;
+      const subVal = filterBar.querySelector('[data-filter-idx="1"]').value;
+      const gradeVal = filterBar.querySelector('[data-filter-idx="2"]').value;
+      const minRaw = filterBar.querySelector('[data-filter-idx="3"]').value;
+      const minOverall = minRaw ? parseFloat(minRaw) : null;
+      const stockVal = (filterBar.querySelector('[data-filter-idx="4"]').value || '').toLowerCase();
+      return rows.filter(r => {
+        if (indexVal && !r._indexes.includes(indexVal)) return false;
+        if (subVal && r._subSector !== subVal) return false;
+        if (gradeVal && (r['Grade'] || '') !== gradeVal) return false;
+        if (minOverall !== null && (r._overall == null || r._overall < minOverall)) return false;
+        if (stockVal && !(r['Stock'] || '').toLowerCase().includes(stockVal)) return false;
+        return true;
+      });
+    }
+
+    function renderPillarBlock(name, checks) {
+      if (!checks || checks.length === 0) {
+        return `<div style="margin-bottom:0.5rem;"><strong>${name}:</strong>
+          <span style="color:var(--text-muted);">no evaluable checks</span></div>`;
+      }
+      const items = checks.map(c => {
+        const valHtml = c.value ? ` <span style="color:var(--text-muted);">${c.value}</span>` : '';
+        const detailHtml = c.detail ? ` <span style="color:var(--text-muted);font-style:italic;">— ${c.detail}</span>` : '';
+        return `<li style="padding:0.15rem 0;">${statusIcon(c.status)} ${c.label}${valHtml}${detailHtml}</li>`;
+      }).join('');
+      return `<div style="margin-bottom:0.75rem;">
+        <strong style="color:var(--accent);">${name}</strong>
+        <ul style="list-style:none;padding-left:1rem;margin:0.25rem 0 0;font-size:0.85rem;">${items}</ul>
+      </div>`;
+    }
+
+    function renderDetail(symbol) {
+      const data = deepData[symbol];
+      if (!data || !data.pillars) {
+        return '<div style="color:var(--text-muted);padding:0.75rem;">No detail data for this stock.</div>';
+      }
+      const order = ['Fundamental', 'Valuation', 'Technical', 'Sentiment'];
+      return `<div style="padding:0.75rem 1rem;background:var(--bg-subtle, rgba(127,127,127,0.05));border-radius:0.4rem;">
+        ${order.map(name => renderPillarBlock(name, data.pillars[name])).join('')}
+      </div>`;
+    }
+
+    function reRender() {
+      const filtered = applyFilters();
+      countEl.textContent = `${filtered.length} / ${rows.length} stocks`;
+      if (filtered.length === 0) {
+        tableEl.innerHTML = '<div class="card"><p>No stocks match the current filters.</p></div>';
+        return;
+      }
+      const headers = ['Stock', 'Price', 'Sub-sector', 'Indexes', 'Fund', 'Tech', 'Sentiment', 'Overall', 'Grade', 'Top Strengths', 'Top Risks'];
+      const head = `<tr>${headers.map(h => `<th>${h}</th>`).join('')}</tr>`;
+      const body = filtered.map((r, i) => {
+        const sym = r['Stock'] || '';
+        const idxBadges = (r._indexes || []).map(indexBadge).join('');
+        const summary = `<tr class="iw-deep-row" data-symbol="${sym}" data-idx="${i}" style="cursor:pointer;">
+          <td style="font-weight:600;">${sym}</td>
+          <td>${formatCell('price', r['Price'] || '')}</td>
+          <td style="color:var(--text-muted);">${r['Sub-sector'] || ''}</td>
+          <td>${idxBadges || '<span style="color:var(--text-muted);">—</span>'}</td>
+          <td>${pillarBadge(r['Fund'] || '')}</td>
+          <td>${pillarBadge(r['Tech'] || '')}</td>
+          <td>${pillarBadge(r['Sentiment'] || '')}</td>
+          <td>${pillarBadge(r['Overall'] || '')}</td>
+          <td>${gradeBadge(r['Grade'])}</td>
+          <td style="color:var(--text-muted);font-size:0.85rem;">${r['Top Strengths'] || ''}</td>
+          <td style="color:var(--text-muted);font-size:0.85rem;">${r['Top Risks'] || ''}</td>
+        </tr>`;
+        const detail = `<tr class="iw-deep-detail" data-detail-for="${i}" style="display:none;">
+          <td colspan="${headers.length}">${renderDetail(sym)}</td>
+        </tr>`;
+        return summary + detail;
+      }).join('');
+      tableEl.innerHTML = `<div class="table-wrapper"><table><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
+
+      tableEl.querySelectorAll('.iw-deep-row').forEach(rowEl => {
+        rowEl.addEventListener('click', () => {
+          const idx = rowEl.getAttribute('data-idx');
+          const detailRow = tableEl.querySelector(`.iw-deep-detail[data-detail-for="${idx}"]`);
+          if (!detailRow) return;
+          detailRow.style.display = detailRow.style.display === 'none' ? '' : 'none';
+        });
+      });
     }
 
     filterBar.querySelectorAll('select, input').forEach(el => {
